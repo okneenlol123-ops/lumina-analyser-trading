@@ -1,0 +1,280 @@
+ <!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ETF Analyse — Multi-Region</title>
+
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    :root{
+      --bg:#0f1724;
+      --card:#0b1220;
+      --accent:#06b6d4;
+      --muted:#94a3b8;
+      --buy:#16a34a;
+      --sell:#ef4444;
+      color-scheme: dark;
+    }
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#081226 0%, #071427 100%);font-family:Inter, Roboto, system-ui, sans-serif;color:#e6eef6}
+    .container{max-width:1100px;margin:28px auto;padding:18px;}
+    h1{margin:0 0 12px;font-size:20px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03);padding:12px;border-radius:10px;box-shadow: 0 6px 18px rgba(2,6,23,0.6)}
+    .meta{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+    .meta .title{font-weight:600}
+    .meta .ticker{color:var(--muted);font-size:13px}
+    canvas{width:100%!important;height:240px!important}
+    .status{display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:10px}
+    .recommend{padding:8px 12px;border-radius:8px;font-weight:700}
+    .rec-buy{background:linear-gradient(90deg, rgba(22,163,74,0.12), rgba(22,163,74,0.06));color:var(--buy);border:1px solid rgba(22,163,74,0.12)}
+    .rec-sell{background:linear-gradient(90deg, rgba(239,68,68,0.12), rgba(239,68,68,0.06));color:var(--sell);border:1px solid rgba(239,68,68,0.12)}
+    .small{font-size:13px;color:var(--muted)}
+    .controls{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+    input[type=text]{padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit}
+    button{padding:8px 12px;border-radius:8px;border:none;background:var(--accent);color:#042033;font-weight:700;cursor:pointer}
+    .note{margin-top:10px;color:var(--muted);font-size:13px}
+    @media (max-width:420px){canvas{height:200px!important}}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>ETF Analyse — Deutschland, USA, Europa, Asien, Welt</h1>
+
+    <div class="controls card" style="align-items:center;">
+      <label class="small">Alpha Vantage API Key:</label>
+      <input id="apiKey" type="text" placeholder="(optional) API Key eintragen" />
+      <button id="refreshBtn">Daten laden / Aktualisieren</button>
+      <div style="margin-left:auto" class="small">Empfehlung: 20d / 50d SMA-Crossover (Demo)</div>
+    </div>
+
+    <div class="grid" id="cardsContainer">
+      <!-- Cards werden per JS eingefügt -->
+    </div>
+
+    <div class="note card">
+      <strong>Achtung:</strong> Die Empfehlung ist nur ein technischer Indikator (20-Tage vs 50-Tage SMA). Keine Anlageberatung.
+      <br>Alpha Vantage hat Rate-Limits (5 Anfragen pro Minute für Free Key). Bei leeren API-Key werden Demo-Daten angezeigt.
+    </div>
+  </div>
+
+<script>
+/*
+  Konfiguration:
+  - regionTikers: Standard-ETFs/Tickers pro Region (du kannst hier deine gewünschten Ticker einsetzen)
+  - dataProvider: Alpha Vantage (TIME_SERIES_DAILY_ADJUSTED)
+  - Empfehlung: Kaufen wenn SMA20 > SMA50 (letzter tag)
+*/
+
+const regionTickers = [
+  {region: "Deutschland", ticker: "EWG", label: "iShares MSCI Germany (EWG) — Stellvertretend"},
+  {region: "USA", ticker: "SPY", label: "SPDR S&P 500 ETF Trust (SPY)"},
+  {region: "Europa", ticker: "VGK", label: "Vanguard FTSE Europe (VGK)"},
+  {region: "Asien", ticker: "AAXJ", label: "iShares MSCI Asia ex Japan (AAXJ)"},
+  {region: "Welt", ticker: "VT", label: "Vanguard Total World (VT)"}
+];
+
+// Demo-Daten generator (falls kein API key)
+function generateDemoSeries(days=180, start=100){
+  const arr = [];
+  let price = start;
+  for(let i=0;i<days;i++){
+    // kleine zufällige Bewegung
+    const change = (Math.random()-0.48) * 1.8;
+    price = Math.max(1, price + change);
+    const d = new Date();
+    d.setDate(d.getDate() - (days - i));
+    arr.push({date: d.toISOString().slice(0,10), close: +price.toFixed(2)});
+  }
+  return arr;
+}
+
+function sma(values, period){
+  if(values.length < period) return null;
+  const res = [];
+  for(let i=0;i<=values.length-period;i++){
+    const slice = values.slice(i,i+period);
+    const v = slice.reduce((s,x)=>s+x,0)/period;
+    res.push(+v.toFixed(4));
+  }
+  return res;
+}
+
+// baut das Layout
+const container = document.getElementById('cardsContainer');
+function buildCards(){
+  container.innerHTML = '';
+  regionTickers.forEach((r, idx) => {
+    const card = document.createElement('div'); card.className = 'card';
+    card.innerHTML = `
+      <div class="meta">
+        <div>
+          <div class="title">${r.region}</div>
+          <div class="ticker">${r.ticker} · <span class="small">${r.label}</span></div>
+        </div>
+        <div class="small" id="lastPrice-${idx}">Lädt…</div>
+      </div>
+      <canvas id="chart-${idx}"></canvas>
+      <div class="status">
+        <div id="rec-${idx}" class="recommend rec-sell">Lädt…</div>
+        <div style="flex:1" class="small" id="explain-${idx}"></div>
+        <div>
+          <button id="btnBuy-${idx}">Kaufen</button>
+          <button id="btnSell-${idx}">Nicht kaufen</button>
+        </div>
+      </div>
+    `;
+    container.appendChild(card);
+    // buttons: Klicks nur Demo (du kannst hier tatsächliche Aktionen einbauen)
+    document.addEventListener('click', (ev) => {
+      if(ev.target && ev.target.id === `btnBuy-${idx}`) alert(`${r.ticker}: Aktion -> Kaufen (Demo).`);
+      if(ev.target && ev.target.id === `btnSell-${idx}`) alert(`${r.ticker}: Aktion -> Nicht kaufen (Demo).`);
+    });
+  });
+}
+buildCards();
+
+// Chart store
+const charts = [];
+
+async function fetchAlphaVantageDailyClose(ticker, apiKey){
+  // Alpha Vantage TIME_SERIES_DAILY_ADJUSTED
+  // Rate limits apply. returns array of {date, close} sorted ascending by date
+  if(!apiKey) throw new Error('Kein API Key');
+  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=${encodeURIComponent(ticker)}&outputsize=compact&apikey=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error('Fehler beim Holen der Daten');
+  const data = await res.json();
+  if(data['Error Message'] || data['Note'] || !data['Time Series (Daily)']) {
+    throw new Error('API Antwort ungültig oder Rate-Limit / Symbol nicht gefunden: ' + (data['Note']||data['Error Message']||'unknown'));
+  }
+  const ts = data['Time Series (Daily)'];
+  const arr = Object.keys(ts).map(d => ({date: d, close: +ts[d]['4. close']}))
+                .sort((a,b)=> new Date(a.date) - new Date(b.date));
+  return arr;
+}
+
+function renderChart(idx, arr, ticker){
+  const ctx = document.getElementById(`chart-${idx}`).getContext('2d');
+  const labels = arr.map(x => x.date);
+  const closes = arr.map(x => x.close);
+
+  // Berechne SMAs auf dem Ende des Arrays
+  const sma20 = sma(closes, 20);
+  const sma50 = sma(closes, 50);
+  const sma20Full = Array(closes.length - (sma20 ? sma20.length : 0)).fill(null).concat(sma20 || []);
+  const sma50Full = Array(closes.length - (sma50 ? sma50.length : 0)).fill(null).concat(sma50 || []);
+
+  // Empfehlung: Wenn letzter SMA20 > letzter SMA50 => Kaufen
+  let recommendation = {buy:false, reason: 'Nicht genug Daten'};
+  if(sma20 && sma50){
+    const lastSma20 = sma20[sma20.length-1];
+    const lastSma50 = sma50[sma50.length-1];
+    if(lastSma20 > lastSma50){
+      recommendation = {buy:true, reason:`SMA20 (${lastSma20.toFixed(2)}) > SMA50 (${lastSma50.toFixed(2)})`};
+    } else {
+      recommendation = {buy:false, reason:`SMA20 (${lastSma20.toFixed(2)}) <= SMA50 (${lastSma50.toFixed(2)})`};
+    }
+  }
+
+  // remove existing chart if present
+  if(charts[idx]) charts[idx].destroy();
+  charts[idx] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {label: `${ticker} Close`, data: closes, borderWidth:1.6, tension:0.18, pointRadius:0},
+        {label: 'SMA20', data: sma20Full, borderDash:[6,4], borderWidth:1.2, tension:0.18, pointRadius:0},
+        {label: 'SMA50', data: sma50Full, borderDash:[8,6], borderWidth:1.2, tension:0.18, pointRadius:0}
+      ]
+    },
+    options: {
+      plugins:{
+        legend:{display:true, labels:{boxWidth:10}}
+      },
+      scales:{
+        x:{display:true, grid:{display:false}, ticks:{maxRotation:0}},
+        y:{display:true, grid:{color:'rgba(255,255,255,0.03)'}}
+      },
+      maintainAspectRatio:false
+    }
+  });
+
+  // UI updates: last price + recommendation
+  const lastPriceEl = document.getElementById(`lastPrice-${idx}`);
+  const recEl = document.getElementById(`rec-${idx}`);
+  const explainEl = document.getElementById(`explain-${idx}`);
+
+  lastPriceEl.textContent = `Letzter: ${closes[closes.length-1].toFixed(2)}`;
+
+  if(recommendation.buy){
+    recEl.className = 'recommend rec-buy';
+    recEl.textContent = 'Kaufen';
+  } else {
+    recEl.className = 'recommend rec-sell';
+    recEl.textContent = 'Nicht kaufen';
+  }
+  explainEl.textContent = recommendation.reason;
+}
+
+// Lade daten für alle Regionen
+async function loadAll(){
+  const apiKey = document.getElementById('apiKey').value.trim();
+  for(let i=0;i<regionTickers.length;i++){
+    const t = regionTickers[i].ticker;
+    const elRec = document.getElementById(`rec-${i}`);
+    if(elRec) elRec.textContent = 'Lädt…';
+
+    try {
+      let arr;
+      if(apiKey){
+        // Versuch Alpha Vantage
+        try {
+          arr = await fetchAlphaVantageDailyClose(t, apiKey);
+        } catch(e){
+          console.warn('AlphaVantage error for', t, e.message);
+          // fallback to demo
+          arr = generateDemoSeries(180, 100 + Math.random()*50);
+        }
+      } else {
+        // Demo data path
+        arr = generateDemoSeries(180, 100 + Math.random()*50);
+      }
+      // nutze letzten 180 Tage (oder weniger)
+      const windowed = arr.slice(-180);
+      renderChart(i, windowed, t);
+    } catch(err){
+      console.error('Error for', t, err);
+      // falls fehler show demo
+      const fallback = generateDemoSeries(120, 80 + Math.random()*40);
+      renderChart(i, fallback, t);
+    }
+    // Achtung: Falls du Alpha Vantage free keys nutzt, bitte Rate-Limit beachten (5 req/min).
+  }
+}
+
+document.getElementById('refreshBtn').addEventListener('click', async ()=>{
+  // einfache throttle/safety: disable kurz
+  const btn = document.getElementById('refreshBtn');
+  btn.disabled = true;
+  btn.textContent = 'Lädt…';
+  try {
+    await loadAll();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Daten laden / Aktualisieren';
+  }
+});
+
+// initial load
+document.addEventListener('DOMContentLoaded', () => {
+  // baue Karten + lade Demo initial
+  buildCards();
+  loadAll();
+});
+</script>
+</body>
+</html>

@@ -1,4 +1,6 @@
 # main.py
+import subprocess, sys
+subprocess.run([sys.executable, "-m", "pip", "install", "yfinance", "plotly", "pandas", "requests"], check=False)
 import streamlit as st
 import pandas as pd
 import numpy as np

@@ -1,16 +1,15 @@
-# main.py
 import streamlit as st
 import random
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="ETF & Krypto Analyse (Minimal)", page_icon="📊", layout="wide")
+st.set_page_config(page_title="ETF & Krypto Graphen", page_icon="📈", layout="wide")
 
-st.title("📊 ETF & Krypto Analyse – Offline Version")
-st.write("Diese Version funktioniert ohne externe Module. Alle Daten sind simuliert. Keine Anlageberatung.")
+st.title("📈 ETF & Krypto Analyse – Offline Graphen")
+st.write("Alle Daten sind simuliert. Keine externe Module, keine API. Keine Anlageberatung.")
 
 # --- Helper functions ---
 def generate_fake_data(days=180, start_price=100):
-    """Erstellt einfache simulierte Preisdaten als Liste von (Datum, Preis)."""
+    """Simuliert Preisbewegungen"""
     today = datetime.utcnow().date()
     prices = []
     price = start_price
@@ -21,7 +20,7 @@ def generate_fake_data(days=180, start_price=100):
     return prices
 
 def simple_recommendation(prices):
-    """Einfache Regel: Wenn letzter Preis > Durchschnitt → Kaufen"""
+    """Letzter Preis über Durchschnitt -> Kaufen"""
     if not prices:
         return False, "Keine Daten"
     last_price = prices[-1][1]
@@ -31,36 +30,27 @@ def simple_recommendation(prices):
     else:
         return False, f"Letzter Preis ({last_price:.2f}) unter Durchschnitt ({avg_price:.2f})"
 
-def show_text_chart(prices, title):
-    """Zeigt einen einfachen ASCII-Chart (Textgrafik)."""
-    st.markdown(f"#### {title}")
-    if not prices:
-        st.write("Keine Daten verfügbar.")
-        return
-    # Normalisiere Werte für Text-Diagramm
-    values = [p[1] for p in prices]
-    min_val, max_val = min(values), max(values)
-    scale = 20 / (max_val - min_val) if max_val != min_val else 1
-    chart_lines = ""
-    for date, val in prices[-30:]:  # letzte 30 Tage
-        height = int((val - min_val) * scale)
-        chart_lines += f"{date} | " + "█" * height + f" ({val})\n"
-    st.text(chart_lines)
+def prepare_line_data(prices):
+    """Wandelt Liste von (Datum, Preis) in dict für st.line_chart"""
+    # letzte 30 Tage für Übersicht
+    last_prices = prices[-30:]
+    return {str(date): price for date, price in last_prices}
 
-# --- Benutzeroptionen ---
+# --- UI ---
 days = st.slider("Zeitraum (Tage)", 30, 365, 180)
-st.write("Es werden zufällige Kursbewegungen angezeigt (Demo).")
 
 tabs = st.tabs(["ETFs", "Kryptowährungen"])
 
 # --- ETFs ---
 with tabs[0]:
-    etfs = ["Deutschland", "USA", "Europa", "Asien", "Welt"]
     st.header("ETFs")
+    etfs = ["Deutschland", "USA", "Europa", "Asien", "Welt"]
     for name in etfs:
         data = generate_fake_data(days, start_price=random.randint(80, 200))
         buy, reason = simple_recommendation(data)
-        show_text_chart(data, f"{name} (Demo)")
+        chart_data = prepare_line_data(data)
+        st.subheader(f"{name} (Demo)")
+        st.line_chart(chart_data)
         st.write(f"Letzter Preis: **{data[-1][1]:.2f} €**")
         if buy:
             st.success("Empfehlung: Kaufen")
@@ -73,12 +63,14 @@ with tabs[0]:
 
 # --- Kryptowährungen ---
 with tabs[1]:
-    cryptos = ["Bitcoin", "Ethereum", "Solana", "BNB", "Cardano"]
     st.header("Kryptowährungen")
+    cryptos = ["Bitcoin", "Ethereum", "Solana", "BNB", "Cardano"]
     for name in cryptos:
         data = generate_fake_data(days, start_price=random.randint(1000, 60000))
         buy, reason = simple_recommendation(data)
-        show_text_chart(data, f"{name} (Demo)")
+        chart_data = prepare_line_data(data)
+        st.subheader(f"{name} (Demo)")
+        st.line_chart(chart_data)
         st.write(f"Letzter Preis: **{data[-1][1]:.2f} USD**")
         if buy:
             st.success("Empfehlung: Kaufen")
@@ -90,4 +82,4 @@ with tabs[1]:
         st.markdown("---")
 
 st.markdown("### ℹ️ Hinweis")
-st.info("Diese Version verwendet keinerlei externe Pakete oder APIs. Alles läuft offline mit simulierten Daten.")
+st.info("Offline-Demo. Graphen zeigen die simulierten Kurse der letzten 30 Tage.")

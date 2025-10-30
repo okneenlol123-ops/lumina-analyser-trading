@@ -2,12 +2,12 @@ import streamlit as st
 import random
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="ETF & Krypto Analyse – Graphen", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Finanzanalyse – ETFs, Krypto & Aktien", page_icon="📈", layout="wide")
 
-st.title("📈 ETF & Krypto Analyse – Offline Graphen")
-st.write("Alle Daten simuliert. Keine API, keine externen Module. Keine Anlageberatung.")
+st.title("📈 Finanzanalyse – ETFs, Kryptowährungen & Aktien")
+st.write("Alle Daten sind simuliert. Keine externen Module, keine API. Nur zu Demonstrationszwecken.")
 
-# --- Helper Functions ---
+# --- Helper functions ---
 def generate_fake_data(days=180, start_price=100):
     """Simuliert Preisbewegungen mit SMA20 und SMA50."""
     today = datetime.utcnow().date()
@@ -19,7 +19,7 @@ def generate_fake_data(days=180, start_price=100):
         else:
             price = round(prices[-1][1] * (1 + random.uniform(-0.02, 0.02)), 2)
         prices.append([date, price])
-    # SMA20 und SMA50 simuliert
+    # SMA20 und SMA50 berechnen
     sma20 = []
     sma50 = []
     for i in range(days):
@@ -41,7 +41,7 @@ def simple_recommendation(prices):
         return False, f"Letzter Preis ({last_price:.2f}) unter SMA50 ({last_sma50:.2f})"
 
 def prepare_line_chart_data(prices):
-    """Erzeugt dicts für Streamlit line_chart"""
+    """Bereitet Daten für Streamlit line_chart vor"""
     data_dict = {
         "Preis": {str(p[0]): p[1] for p in prices},
         "SMA20": {str(p[0]): p[2] for p in prices},
@@ -50,7 +50,7 @@ def prepare_line_chart_data(prices):
     return data_dict
 
 def filter_prices_by_interval(prices, interval):
-    """Filtert Daten nach gewähltem Zeitraum"""
+    """Filtert Daten nach Zeitraum"""
     today = datetime.utcnow().date()
     if interval == "1 Monat":
         cutoff = today - timedelta(days=30)
@@ -70,18 +70,17 @@ def filter_prices_by_interval(prices, interval):
 
 # --- UI ---
 interval_options = ["1 Monat","3 Monate","6 Monate","1 Jahr","5 Jahre","10 Jahre"]
-
-tabs = st.tabs(["ETFs","Kryptowährungen"])
+tabs = st.tabs(["📊 ETFs", "💰 Kryptowährungen", "🏦 Aktien"])
 
 # --- ETFs ---
 with tabs[0]:
-    st.header("ETFs")
-    etfs = ["Deutschland","USA","Europa","Asien","Welt"]
+    st.header("📊 ETFs")
+    etfs = ["Deutschland", "USA", "Europa", "Asien", "Welt"]
     for name in etfs:
-        col1, col2 = st.columns([3,1])
+        col1, col2 = st.columns([3, 1])
         with col2:
             interval = st.selectbox(f"Zeitraum für {name}", interval_options, key=f"etf_interval_{name}")
-        data = generate_fake_data(365*10, start_price=random.randint(80,200))  # max 10 Jahre
+        data = generate_fake_data(365*10, start_price=random.randint(80, 200))
         filtered = filter_prices_by_interval(data, interval)
         chart_data = prepare_line_chart_data(filtered)
         buy, reason = simple_recommendation(filtered)
@@ -101,13 +100,13 @@ with tabs[0]:
 
 # --- Kryptowährungen ---
 with tabs[1]:
-    st.header("Kryptowährungen")
-    cryptos = ["Bitcoin","Ethereum","Solana","BNB","Cardano"]
+    st.header("💰 Kryptowährungen")
+    cryptos = ["Bitcoin", "Ethereum", "Solana", "BNB", "Cardano"]
     for name in cryptos:
-        col1, col2 = st.columns([3,1])
+        col1, col2 = st.columns([3, 1])
         with col2:
             interval = st.selectbox(f"Zeitraum für {name}", interval_options, key=f"crypto_interval_{name}")
-        data = generate_fake_data(365*10, start_price=random.randint(1000,60000))
+        data = generate_fake_data(365*10, start_price=random.randint(1000, 60000))
         filtered = filter_prices_by_interval(data, interval)
         chart_data = prepare_line_chart_data(filtered)
         buy, reason = simple_recommendation(filtered)
@@ -125,5 +124,31 @@ with tabs[1]:
             st.button(f"Nicht kaufen (Demo) – {name}", key=f"crypto_sell_{name}")
         st.markdown("---")
 
+# --- Aktien ---
+with tabs[2]:
+    st.header("🏦 Aktien")
+    stocks = ["Apple", "Tesla", "Microsoft", "Siemens", "Allianz", "Volkswagen", "Amazon"]
+    for name in stocks:
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            interval = st.selectbox(f"Zeitraum für {name}", interval_options, key=f"stock_interval_{name}")
+        data = generate_fake_data(365*10, start_price=random.randint(50, 1000))
+        filtered = filter_prices_by_interval(data, interval)
+        chart_data = prepare_line_chart_data(filtered)
+        buy, reason = simple_recommendation(filtered)
+        with col1:
+            st.subheader(f"{name} (Demo)")
+            st.line_chart(chart_data)
+        with col2:
+            st.write(f"Letzter Preis: **{filtered[-1][1]:.2f} €**")
+            if buy:
+                st.success("Empfehlung: Kaufen")
+            else:
+                st.error("Empfehlung: Nicht kaufen")
+            st.caption(reason)
+            st.button(f"Kaufen (Demo) – {name}", key=f"stock_buy_{name}")
+            st.button(f"Nicht kaufen (Demo) – {name}", key=f"stock_sell_{name}")
+        st.markdown("---")
+
 st.markdown("### ℹ️ Hinweis")
-st.info("Offline-Demo. Graphen zeigen simulierte Kurse und SMA-Linien. Zeitraum für jeden Graphen wählbar.")
+st.info("Offline-Demo. Zeigt simulierte Kursverläufe (Preis + SMA20 + SMA50) mit einstellbaren Zeiträumen.")

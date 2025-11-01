@@ -200,17 +200,13 @@ def portfolio_snapshot():
 
 # ------------------- NOTIFICATIONS -------------------
 def check_notifications():
-    notices = []
-    for r in portfolio_snapshot()["rows"]:
-        if r["pnl_pct"] >= 10:
-            notices.append(f"🔔 {r['item']['name']} Gewinn über +10%: {r['pnl_pct']:.2f}%")
-        if r["pnl_pct"] <= -10:
-            notices.append(f"⚠️ {r['item']['name']} Verlust über ‑10%: {r['pnl_pct']:.2f}%")
-    for msg in notices:
-        st.toast(msg, icon="bell")  # uses streamlit's toast if available
-
+    notifications = ["Testnachricht 1", "Testnachricht 2"]  # Beispiel
+    for msg in notifications:
+        try:
+            st.toast(msg, icon="🔔")  # funktioniert in neueren Streamlit
+        except Exception:
+            st.info(f"🔔 {msg}")  # Fallback für ältere Version
 check_notifications()
-
 # ------------------- UI: Sidebar Navigation -------------------
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Seiten", ["Home","Marktplatz","Portfolio","Statistiken","Wissensbasis","Export/Import","Einstellungen"])

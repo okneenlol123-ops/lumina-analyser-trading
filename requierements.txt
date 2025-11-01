@@ -1,1 +1,5 @@
-streamlit
+streamlit==1.39.0
+plotly==5.24.1
+pandas==2.2.2
+reportlab==4.2.5
+numpy==1.26.4

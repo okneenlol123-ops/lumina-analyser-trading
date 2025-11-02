@@ -672,8 +672,11 @@ elif page == "Portfolio":
         st.subheader("Analyse & Benchmark")
         ra = risk_analyzer_score()
         st.write(f"Risikoscore: **{ra['score']}**  •  Vol-Komponente: {ra['volatility_component']} • Konzentration: {ra['concentration_component']}")
-        # produce historical portfolio simulation (robust)
-        hist = simulate_over_time_safe(180 := 180) if 'simulate_over_time_safe' in globals() else simulate_over_time(180)
+        # produce historical portfolio simulation (robust) 
+        if 'simulate_over_time_safe' in globals():
+        hist = simulate_over_time_safe(180)
+    else:
+        hist = simulate_over_time(180)
         # we'll use simulate_over_time defined below; to avoid NameError, define simulate_over_time earlier — ensure exists
         try:
             hist = simulate_over_time(180)

@@ -1,4 +1,12 @@
-# main.py
+import streamlit as st
+import matplotlib.pyplot as plt
+
+st.title("✅ Matplotlib funktioniert!")
+
+fig, ax = plt.subplots()
+ax.plot([1, 2, 3], [10, 15, 7], color='lime')
+ax.set_facecolor("#000000")
+st.pyplot(fig)# main.py
 # Offline Daytrading Simulator with matplotlib candlesticks + live update
 # No external market APIs. Deterministic simulation per asset id.
 import streamlit as st

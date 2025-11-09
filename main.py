@@ -1,5 +1,5 @@
 # main.py
-# Offline Daytrading Simulator + SMC Overlays (SVG) — Streamlit only
+# Offline Daytrading Simulator — SVG candles + markers + RSI + dynamic Stop-Loss + Long/Short
 import streamlit as st
 import random
 import json
@@ -10,8 +10,8 @@ from math import floor
 # ----------------------------
 # Config
 # ----------------------------
-st.set_page_config(page_title="SMC Daytrading Simulator (SVG)", layout="wide")
-st.title("Offline Daytrading Simulator — SMC Overlays (SVG)")
+st.set_page_config(page_title="Offline Daytrading (Stop-Loss + Long/Short)", layout="wide")
+st.title("Offline Daytrading — Stop-Loss, Long/Short & SVG Candles (kein Plotly)")
 
 PORTFOLIO_FILE = "portfolio.json"
 if not os.path.exists(PORTFOLIO_FILE):
@@ -19,7 +19,7 @@ if not os.path.exists(PORTFOLIO_FILE):
         json.dump([], f)
 
 # ----------------------------
-# Assets
+# Assets (10 ETFs, 20 Stocks, 10 Crypto)
 # ----------------------------
 ETFS = [
     "iShares DAX", "SP500 ETF", "MSCI World", "EuroStoxx", "Asia Pacific ETF",
@@ -62,76 +62,117 @@ def make_ohlc_from_prices(prices, candle_size=1):
     ohlc = []
     for i in range(0, len(prices), candle_size):
         chunk = prices[i:i+candle_size]
-        if not chunk: continue
+        if not chunk:
+            continue
         o = chunk[0]; c = chunk[-1]; h = max(chunk); l = min(chunk)
         ohlc.append({"open": o, "high": h, "low": l, "close": c})
     return ohlc
 
 # ----------------------------
-# SMC detection helpers (heuristic)
+# RSI helper
 # ----------------------------
-def find_swings(candles, lookback=3):
-    """Find local swing highs and lows. Returns lists of (idx, price)."""
-    highs = []
-    lows = []
-    n = len(candles)
-    for i in range(lookback, n-lookback):
-        window_high = max(c["high"] for c in candles[i-lookback:i+lookback+1])
-        window_low  = min(c["low"] for c in candles[i-lookback:i+lookback+1])
-        if candles[i]["high"] == window_high:
-            highs.append((i, candles[i]["high"]))
-        if candles[i]["low"] == window_low:
-            lows.append((i, candles[i]["low"]))
-    return highs, lows
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return [None]*len(closes)
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [d if d>0 else 0 for d in deltas]
+    losses = [-d if d<0 else 0 for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsis = [None] * (period)
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
+        rsi = 100 - (100 / (1 + rs))
+        rsis.append(round(rsi, 2))
+    return rsis
 
-def detect_bos_ch(chandles):
-    """Detect simple Break of Structure (BOS) or Change of Character (CHOCH).
-       Heuristic: last swing high broken by close above -> BOS up; similarly for down.
-       Returns dict with 'type' (up/down/none) and 'level' and 'index'."""
-    candles = chandles
-    highs, lows = find_swings(candles, lookback=3)
-    res = {"type": None, "level": None, "index": None, "broken_from": None}
-    if not highs or not lows:
-        return res
-    # find last two swing highs and lows
-    last_high_idx, last_high = highs[-1] if highs else (None, None)
-    last_low_idx, last_low   = lows[-1] if lows else (None, None)
-    # check if price recently broke above previous swing high -> BOS up
-    last_close = candles[-1]["close"]
-    if last_high is not None and last_close > last_high:
-        res.update({"type": "BOS_up", "level": last_high, "index": last_high_idx, "broken_from": "high"})
-        return res
-    # check if price broke below previous swing low -> BOS down
-    if last_low is not None and last_close < last_low:
-        res.update({"type": "BOS_down", "level": last_low, "index": last_low_idx, "broken_from": "low"})
-        return res
-    return res
+# ----------------------------
+# Pattern detection (markers)
+# ----------------------------
+def is_doji(c):
+    body = abs(c["close"] - c["open"])
+    total = c["high"] - c["low"]
+    return total > 0 and (body / total) < 0.15
 
-def find_liquidity_zone(candles, lookback=20):
-    """Find recent liquidity zone: cluster of lows (for buy-side) or highs (for sell-side).
-       Returns a POI zone as (low, high) and index range."""
-    closes = [c["close"] for c in candles]
-    lows = [c["low"] for c in candles[-lookback:]]
-    highs = [c["high"] for c in candles[-lookback:]]
-    # heuristic: find min low area as buy-side liquidity, and max high area as sell-side liquidity
-    min_low = min(lows) if lows else None
-    max_high = max(highs) if highs else None
-    # define small zone +- a bit
-    if min_low is not None:
-        low_zone = (min_low * 0.997, min_low * 1.003)
+def is_hammer(c):
+    body = abs(c["close"] - c["open"])
+    lower = min(c["open"], c["close"]) - c["low"]
+    return body > 0 and lower > 2 * body
+
+def is_shooting_star(c):
+    body = abs(c["close"] - c["open"])
+    upper = c["high"] - max(c["open"], c["close"])
+    return body > 0 and upper > 2 * body
+
+def is_bullish_engulfing(prev, cur):
+    return (cur["close"] > cur["open"]) and (prev["close"] < prev["open"]) and (cur["open"] < prev["close"]) and (cur["close"] > prev["open"])
+
+def is_bearish_engulfing(prev, cur):
+    return (cur["close"] < cur["open"]) and (prev["close"] > prev["open"]) and (cur["open"] > prev["close"]) and (cur["close"] < prev["open"])
+
+def is_three_white_soldiers(candles):
+    if len(candles) < 3: return False
+    a, b, c = candles[-3], candles[-2], candles[-1]
+    return (a["close"] > a["open"]) and (b["close"] > b["open"]) and (c["close"] > c["open"]) and (b["close"] > a["close"]) and (c["close"] > b["close"])
+
+def detect_markers(candles):
+    markers = []
+    for i in range(1, len(candles)):
+        cur = candles[i]; prev = candles[i-1]
+        if is_bullish_engulfing(prev, cur) or is_hammer(cur):
+            markers.append({"idx": i, "type": "buy", "reason": "Bullish/Hammer"})
+        if is_bearish_engulfing(prev, cur) or is_shooting_star(cur):
+            markers.append({"idx": i, "type": "sell", "reason": "Bearish/Shooting Star"})
+    # three white soldiers detection
+    for i in range(2, len(candles)):
+        if (candles[i-2]["close"] > candles[i-2]["open"] and
+            candles[i-1]["close"] > candles[i-1]["open"] and
+            candles[i]["close"] > candles[i]["open"] and
+            candles[i-1]["close"] > candles[i-2]["close"] and
+            candles[i]["close"] > candles[i-1]["close"]):
+            markers.append({"idx": i, "type": "buy", "reason": "Three White Soldiers"})
+    # deduplicate markers by (idx,type)
+    seen = set()
+    uniq = []
+    for m in markers:
+        key = (m["idx"], m["type"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(m)
+    return uniq
+
+# ----------------------------
+# Stop-Loss calculation (dynamic)
+# ----------------------------
+def calculate_dynamic_stop(entry_price, candles, position_type="long"):
+    """
+    Dynamic stop based on recent volatility:
+    - compute std of returns over last N closes -> vol
+    - recommended stop pct = clamp(vol*3, 0.01..0.10) (i.e. 1%..10%)
+    - for long: stop = entry_price * (1 - stop_pct)
+    - for short: stop = entry_price * (1 + stop_pct)
+    Returns (stop_price, stop_pct)
+    """
+    closes = [c["close"] for c in candles[-30:]] if len(candles) >= 2 else [entry_price]
+    returns = [(closes[i]-closes[i-1]) / closes[i-1] for i in range(1, len(closes))] if len(closes) > 1 else [0.0]
+    import statistics
+    vol = statistics.pstdev(returns) if len(returns) > 0 else 0.0
+    # map vol to pct
+    recommended_pct = max(0.01, min(0.10, vol * 3))
+    if recommended_pct < 0.01:
+        recommended_pct = 0.01
+    if position_type == "long":
+        stop_price = entry_price * (1 - recommended_pct)
     else:
-        low_zone = None
-    if max_high is not None:
-        high_zone = (max_high * 0.997, max_high * 1.003)
-    else:
-        high_zone = None
-    return {"buy_zone": low_zone, "sell_zone": high_zone, "min_low": min_low, "max_high": max_high}
+        stop_price = entry_price * (1 + recommended_pct)
+    return round(stop_price, 6), round(recommended_pct, 4), vol
 
 # ----------------------------
-# SVG renderer with SMC overlays
+# SVG renderer with markers + RSI + stop line
 # ----------------------------
-def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_sma=(20,50),
-                        show_bos=True, show_poi=True, show_entry_stop=True, show_bsl_ssl=True):
+def render_candles_svg_with_markers(candles, markers, stop_line=None, width_px=1000, height_px=460, margin=48, show_sma=(20,50), rsi_vals=None):
     n = len(candles)
     if n == 0:
         return "<svg></svg>"
@@ -140,7 +181,7 @@ def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_s
     pad = (max_p - min_p) * 0.08 if (max_p - min_p) > 0 else 1.0
     max_p += pad; min_p -= pad
 
-    chart_h = height_px - margin * 3  # leave space below
+    chart_h = height_px - margin * 3  # leave space for RSI
     chart_w = width_px - margin * 2
     candle_w = max(3, chart_w / n * 0.7)
     spacing = chart_w / n
@@ -148,47 +189,16 @@ def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_s
     def y_pos(price):
         return margin + chart_h - (price - min_p) / (max_p - min_p) * chart_h
 
-    # SMA
     closes = [c["close"] for c in candles]
     def sma(period):
         res = []
         for i in range(len(closes)):
-            if i+1 < period:
-                res.append(None)
-            else:
-                res.append(sum(closes[i+1-period:i+1]) / period)
+            if i+1 < period: res.append(None)
+            else: res.append(sum(closes[i+1-period:i+1]) / period)
         return res
     sma1 = sma(show_sma[0]) if show_sma and show_sma[0] else []
     sma2 = sma(show_sma[1]) if show_sma and show_sma[1] else []
 
-    # SMC detection
-    bos = detect_bos_ch(candles) if show_bos else {"type": None}
-    poi = find_liquidity_zone(candles, lookback=30) if show_poi else {}
-    markers = []
-    if show_bsl_ssl:
-        # BSL = recent lows cluster (buy-side liquidity zones)
-        if poi.get("min_low"):
-            # find indices within small tolerance
-            tol = (poi["min_low"] * 0.003)
-            for i, c in enumerate(candles[-60:], start=max(0, len(candles)-60)):
-                if abs(c["low"] - poi["min_low"]) <= tol:
-                    markers.append({"idx": i, "type": "BSL", "price": c["low"]})
-        if poi.get("max_high"):
-            tol = (poi["max_high"] * 0.003)
-            for i, c in enumerate(candles[-60:], start=max(0, len(candles)-60)):
-                if abs(c["high"] - poi["max_high"]) <= tol:
-                    markers.append({"idx": i, "type": "SSL", "price": c["high"]})
-
-    # Entry/Stop heuristics: create a POI entry box around min_low and stop below it
-    entry_box = None
-    stop_box = None
-    if show_entry_stop and poi.get("min_low"):
-        # entry area: slightly above liquidity zone
-        z_low, z_high = poi["buy_zone"]
-        entry_box = {"y1": z_low * 0.999, "y2": z_high * 1.006}
-        stop_box = {"y1": z_low * 0.98, "y2": z_low * 0.995}
-
-    # start svg
     svg = []
     svg.append(f'<svg width="{width_px}" height="{height_px}" xmlns="http://www.w3.org/2000/svg">')
     svg.append(f'<rect x="0" y="0" width="{width_px}" height="{height_px}" fill="#0b0b0b" />')
@@ -198,19 +208,7 @@ def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_s
         y = margin + i * (chart_h / 5)
         price_label = round(max_p - i * (max_p - min_p) / 5, 4)
         svg.append(f'<line x1="{margin}" y1="{y}" x2="{width_px-margin}" y2="{y}" stroke="#161616" stroke-width="1"/>')
-        svg.append(f'<text x="6" y="{y+4}" font-size="11" fill="#9aa6b2">{price_label}</text>')
-
-    # draw POI buy zone rectangle (green) and sell zone (if any)
-    if show_poi and poi.get("buy_zone"):
-        y_top = y_pos(entry_box["y2"]) if entry_box else y_pos(poi["buy_zone"][1])
-        y_bot = y_pos(entry_box["y1"]) if entry_box else y_pos(poi["buy_zone"][0])
-        svg.append(f'<rect x="{margin+2}" y="{y_top}" width="{chart_w-4}" height="{max(2, y_bot - y_top)}" fill="#1b4630" opacity="0.25" />')
-        svg.append(f'<text x="{margin+6}" y="{y_top+14}" font-size="12" fill="#9ee6c9">POI / LQ Sweep</text>')
-    if show_poi and poi.get("sell_zone"):
-        y_top_s = y_pos(poi["sell_zone"][1])
-        y_bot_s = y_pos(poi["sell_zone"][0])
-        svg.append(f'<rect x="{margin+2}" y="{y_top_s}" width="{chart_w-4}" height="{max(2, y_bot_s - y_top_s)}" fill="#4a1630" opacity="0.12" />')
-        svg.append(f'<text x="{margin+6}" y="{y_top_s+14}" font-size="12" fill="#f3b1c1">Sell Liquidity</text>')
+        svg.append(f'<text x="{6}" y="{y+4}" font-size="11" fill="#9aa6b2">{price_label}</text>')
 
     # draw candles
     for idx, c in enumerate(candles):
@@ -225,37 +223,25 @@ def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_s
         bh = max(1, abs(body_y_open - body_y_close))
         svg.append(f'<rect x="{x_left}" y="{by}" width="{candle_w}" height="{bh}" fill="{color}" stroke="{color}" rx="1" ry="1" />')
 
-    # draw BOS line if detected
-    if show_bos and bos.get("type") and bos.get("level") is not None:
-        level = bos["level"]
-        y = y_pos(level)
-        svg.append(f'<line x1="{margin}" y1="{y}" x2="{width_px-margin}" y2="{y}" stroke="#FFD700" stroke-width="2" stroke-dasharray="8,6"/>')
-        label = "BOS↑" if bos["type"] == "BOS_up" else "BOS↓"
-        svg.append(f'<text x="{width_px-margin-90}" y="{y-6}" font-size="13" fill="#FFD700">{label}</text>')
-
-    # draw markers (BSL / SSL)
+    # markers: draw arrows, shift them a bit to avoid overlap when many candles
+    # shift scale increases with number of candles
+    shift_px = max(8, min(28, int(200 / n)))  # fewer candles -> small shift; many candles -> slightly larger
     for m in markers:
         i = m["idx"]
+        if i < 0 or i >= n: continue
         x_center = margin + i * spacing + spacing/2
-        if m["type"] == "BSL":
-            y = y_pos(m["price"])
-            svg.append(f'<circle cx="{x_center}" cy="{y}" r="5" fill="#00ff99" opacity="0.9"/>')
-            svg.append(f'<text x="{x_center+8}" y="{y+4}" font-size="11" fill="#9ee6c9">BSL</text>')
+        c = candles[i]
+        y_high = y_pos(c["high"])
+        y_low = y_pos(c["low"])
+        # push markers higher or lower by shift_px
+        if m["type"] == "buy":
+            points = f"{x_center-6},{y_high - (12 + shift_px)} {x_center+6},{y_high - (12 + shift_px)} {x_center},{y_high - (2 + shift_px)}"
+            svg.append(f'<polygon points="{points}" fill="#00ff88" opacity="0.98"><title>{m.get("reason","buy")}</title></polygon>')
         else:
-            y = y_pos(m["price"])
-            svg.append(f'<rect x="{x_center-5}" y="{y-5}" width="10" height="10" fill="#ff9999" opacity="0.9"/>')
-            svg.append(f'<text x="{x_center+8}" y="{y+4}" font-size="11" fill="#f7b1b9">SSL</text>')
+            points = f"{x_center-6},{y_low + (12 + shift_px)} {x_center+6},{y_low + (12 + shift_px)} {x_center},{y_low + (2 + shift_px)}"
+            svg.append(f'<polygon points="{points}" fill="#ff7788" opacity="0.98"><title>{m.get("reason","sell")}</title></polygon>')
 
-    # draw entry & stop boxes
-    if show_entry_stop and entry_box and stop_box:
-        y_entry_top = y_pos(entry_box["y2"]); y_entry_bot = y_pos(entry_box["y1"])
-        y_stop_top = y_pos(stop_box["y2"]); y_stop_bot = y_pos(stop_box["y1"])
-        svg.append(f'<rect x="{margin+chart_w*0.6}" y="{y_entry_top}" width="{chart_w*0.35}" height="{max(2, y_entry_bot - y_entry_top)}" fill="#234b7d" opacity="0.18" />')
-        svg.append(f'<text x="{margin+chart_w*0.62}" y="{y_entry_top+16}" font-size="12" fill="#99ccff">Entry Zone</text>')
-        svg.append(f'<rect x="{margin+chart_w*0.6}" y="{y_stop_top}" width="{chart_w*0.35}" height="{max(2, y_stop_bot - y_stop_top)}" fill="#7a2f2f" opacity="0.18" />')
-        svg.append(f'<text x="{margin+chart_w*0.62}" y="{y_stop_top+16}" font-size="12" fill="#f6a6a6">Stop Zone</text>')
-
-    # SMAs as polylines
+    # SMAs
     def polyline(values, stroke, width=1.5):
         pts = []
         for i, v in enumerate(values):
@@ -270,7 +256,8 @@ def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_s
         for p in pts:
             if p is None:
                 if cur:
-                    segs.append(" ".join(cur)); cur=[]
+                    segs.append(" ".join(cur))
+                    cur = []
             else:
                 cur.append(p)
         if cur: segs.append(" ".join(cur))
@@ -284,6 +271,45 @@ def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_s
     if sma2:
         svg.append(polyline(sma2, "#ffcc66", width=1.6))
 
+    # stop_line: dict {'price':..., 'type': 'long'/'short', 'pct':...}
+    if stop_line:
+        sp = stop_line.get("price")
+        if sp is not None:
+            y_sp = y_pos(sp)
+            color = "#ffcc00" if stop_line.get("type") == "long" else "#ff4444"
+            svg.append(f'<line x1="{margin}" y1="{y_sp}" x2="{width_px-margin}" y2="{y_sp}" stroke="{color}" stroke-width="2" stroke-dasharray="6,4"/>')
+            label = f"Stop ({'Long' if stop_line.get('type')=='long' else 'Short'}): {sp:.4f} ({stop_line.get('pct')*100:.2f}%)"
+            svg.append(f'<rect x="{width_px-margin-220}" y="{y_sp-14}" width="220" height="18" fill="#111" opacity="0.8"/>')
+            svg.append(f'<text x="{width_px-margin-216}" y="{y_sp}" font-size="12" fill="{color}">{label}</text>')
+
+    # RSI area
+    rsi_area_top = margin + chart_h + 10
+    rsi_area_h = height_px - rsi_area_top - 10
+    svg.append(f'<rect x="{margin}" y="{rsi_area_top}" width="{chart_w}" height="{rsi_area_h}" fill="#090909" stroke="#111" />')
+    svg.append(f'<text x="{margin}" y="{rsi_area_top-2}" font-size="12" fill="#9aa6b2">RSI(14)</text>')
+    if rsi_vals:
+        pts = []
+        for i, v in enumerate(rsi_vals):
+            if v is None:
+                pts.append(None); continue
+            x = margin + i * spacing + spacing/2
+            y = rsi_area_top + rsi_area_h - (v / 100.0) * rsi_area_h
+            pts.append(f"{x},{y}")
+        seg = []
+        cur = []
+        for p in pts:
+            if p is None:
+                if cur: seg.append(" ".join(cur)); cur=[]
+            else:
+                cur.append(p)
+        if cur: seg.append(" ".join(cur))
+        for s in seg:
+            svg.append(f'<polyline points="{s}" fill="none" stroke="#ff66cc" stroke-width="1.2" />')
+        y30 = rsi_area_top + rsi_area_h - 0.3 * rsi_area_h
+        y70 = rsi_area_top + rsi_area_h - 0.7 * rsi_area_h
+        svg.append(f'<line x1="{margin}" y1="{y30}" x2="{width_px-margin}" y2="{y30}" stroke="#333" stroke-dasharray="3,3" />')
+        svg.append(f'<line x1="{margin}" y1="{y70}" x2="{width_px-margin}" y2="{y70}" stroke="#333" stroke-dasharray="3,3" />')
+
     # x labels
     for i in range(0, n, max(1, n//10)):
         x = margin + i * spacing + spacing/2
@@ -294,38 +320,43 @@ def render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48, show_s
     return "\n".join(svg)
 
 # ----------------------------
-# Full analysis used for text + reasons
+# Full analysis (with stop suggestion explanation)
+# ----------------------------
+def analyze_candles_with_stop(candles, position_type="long", entry_price=None):
+    analysis = analyze_candles_full(candles) if 'analyze_candles_full' in globals() else {"reasons":[], "recommendation":"Halten", "volatility":0.0, "risk":"Unbekannt"}
+    if entry_price is None:
+        entry_price = candles[-1]["close"]
+    stop_price, stop_pct, vol = calculate_dynamic_stop(entry_price, candles, position_type=position_type)
+    # explanation text
+    explanation = []
+    explanation.append(f"Stop-Loss (dynamisch): {stop_pct*100:.2f}% basierend auf Volatilität (σ ~ {vol:.6f}).")
+    explanation.append("Empfehlung: Platzieren Sie Stop-Loss, um Verluste automatisch zu begrenzen.")
+    explanation.append("Take-Profit: typischerweise 1.5–3× des Stop-Abstands (Risk:Reward).")
+    if position_type == "short":
+        explanation.append("Short-Position: Sie profitieren, wenn der Kurs fällt. Stop liegt oberhalb des Einstiegs.")
+    else:
+        explanation.append("Long-Position: Sie profitieren, wenn der Kurs steigt. Stop liegt unterhalb des Einstiegs.")
+    return {"analysis": analysis, "stop_price": stop_price, "stop_pct": stop_pct, "explanation": explanation}
+
+# ----------------------------
+# Minimal helper analyze (re-using earlier logic)
 # ----------------------------
 def analyze_candles_full(candles):
     reasons = []; score = 0
     cur = candles[-1]; prev = candles[-2] if len(candles)>=2 else None
-    # basic patterns reuse
-    def is_doji(c):
-        body = abs(c["close"] - c["open"]); total = c["high"] - c["low"]
-        return total>0 and (body/total) < 0.15
-    def is_hammer(c):
-        body = abs(c["close"] - c["open"]); lower = min(c["open"], c["close"])-c["low"]; return body>0 and lower>2*body
-    def is_shooting_star(c):
-        body = abs(c["close"] - c["open"]); upper = c["high"]-max(c["open"], c["close"]); return body>0 and upper>2*body
-    def is_bullish_engulfing(prev, cur):
-        return (cur["close"]>cur["open"]) and (prev["close"]<prev["open"]) and (cur["open"]<prev["close"]) and (cur["close"]>prev["open"])
-    def is_bearish_engulfing(prev, cur):
-        return (cur["close"]<cur["open"]) and (prev["close"]>prev["open"]) and (cur["open"]>prev["close"]) and (cur["close"]<prev["open"])
-
-    if is_doji(cur): reasons.append("Doji (Unentschlossen)")
-    if prev and is_bullish_engulfing(prev, cur): reasons.append("Bullish Engulfing"); score+=2
-    if prev and is_bearish_engulfing(prev, cur): reasons.append("Bearish Engulfing"); score-=2
-    if is_hammer(cur): reasons.append("Hammer"); score+=1
-    if is_shooting_star(cur): reasons.append("Shooting Star"); score-=1
-
+    if is_doji(cur): reasons.append("Doji")
+    if prev and is_bullish_engulfing(prev, cur): reasons.append("Bullish Engulfing"); score += 2
+    if prev and is_bearish_engulfing(prev, cur): reasons.append("Bearish Engulfing"); score -= 2
+    if is_hammer(cur): reasons.append("Hammer"); score += 1
+    if is_shooting_star(cur): reasons.append("Shooting Star"); score -= 1
+    if is_three_white_soldiers(candles): reasons.append("Three White Soldiers"); score += 2
     closes = [c["close"] for c in candles[-30:]]
-    returns = [(closes[i]-closes[i-1])/closes[i-1] for i in range(1, len(closes))] if len(closes)>1 else [0.0]
+    returns = [(closes[i]-closes[i-1])/closes[i-1] for i in range(1,len(closes))] if len(closes)>1 else [0.0]
     import statistics
     vol = statistics.pstdev(returns) if len(returns)>0 else 0.0
     trend = sum(returns)
-    if trend > 0.01: reasons.append("Positives Momentum"); score+=1
-    if trend < -0.01: reasons.append("Negatives Momentum"); score-=1
-
+    if trend > 0.01: reasons.append("Positives Momentum"); score += 1
+    if trend < -0.01: reasons.append("Negatives Momentum"); score -= 1
     rec = "Kaufen" if score>=2 else ("Verkaufen" if score<=-2 else "Halten / Beobachten")
     if vol < 0.001: risk="Niedrig"
     elif vol < 0.01: risk="Mittel"
@@ -348,22 +379,20 @@ col_main, col_side = st.columns([3,1])
 with col_side:
     st.header("Steuerung")
     timeframe = st.selectbox("Timeframe", ["1m","5m","10m","30m","1h","3h","12h","1d"], index=1)
-    periods = st.slider("Anzahl Kerzen", min_value=30, max_value=400, value=120, step=10)
+    periods = st.slider("Anzahl Kerzen", min_value=20, max_value=500, value=120, step=10)
     start_price = st.number_input("Startpreis (Sim)", min_value=0.01, value=100.0, step=0.1)
     show_sma1 = st.checkbox("SMA 20 anzeigen", value=True)
     show_sma2 = st.checkbox("SMA 50 anzeigen", value=False)
     search = st.text_input("Asset Suche (Name)", value="")
     refresh = st.button("Neue Simulation / Refresh")
-    show_bos = st.checkbox("BOS Linien anzeigen", value=True)
-    show_poi = st.checkbox("POI / LQ Zone anzeigen", value=True)
-    show_entry_stop = st.checkbox("Entry/Stop Zonen anzeigen", value=True)
-    show_bsl_ssl = st.checkbox("BSL/SSL Markierungen anzeigen", value=True)
     add_qty = st.number_input("Schnell: Menge zum Portfolio", min_value=0.0, value=1.0, step=0.1)
+    pos_type = st.radio("Positionstyp", ["long","short"], index=0)
+    custom_stop_pct = st.slider("Manueller Stop-Loss (%) (optional, 0 = auto)", min_value=0.0, max_value=20.0, value=0.0, step=0.1)
     if st.button("Portfolio exportieren"):
         st.download_button("Download JSON", data=json.dumps(st.session_state.portfolio, ensure_ascii=False, indent=2), file_name="portfolio.json", mime="application/json")
 
 with col_main:
-    st.header("Chart & SMC Analyse")
+    st.header("Chart & Analyse")
     filter_list = [a["name"] for a in ALL_ASSETS if search.strip().lower() in a["name"].lower()] if search else [a["name"] for a in ALL_ASSETS]
     sel = st.selectbox("Wähle Asset", filter_list, index=0)
     asset_id = NAME_TO_ID.get(sel.lower(), f"AS_{abs(hash(sel))%100000}")
@@ -380,37 +409,65 @@ with col_main:
         st.session_state.series_cache[cache_key] = ohlc[-periods:]
     candles = st.session_state.series_cache[cache_key]
 
-    markers = []  # SBL/SSL markers will be included in render if enabled
-    svg = render_svg_with_smc(candles, width_px=1000, height_px=480, margin=48,
-                              show_sma=(20 if show_sma1 else 0, 50 if show_sma2 else 0),
-                              show_bos=show_bos, show_poi=show_poi, show_entry_stop=show_entry_stop, show_bsl_ssl=show_bsl_ssl)
+    # detect markers & compute rsi
+    markers = detect_markers(candles)
+    closes = [c["close"] for c in candles]
+    rsi = compute_rsi(closes, period=14)
+
+    # compute suggested stop
+    entry_price = candles[-1]["close"]
+    stop_price_auto, stop_pct_auto, vol = calculate_dynamic_stop(entry_price, candles, position_type=pos_type)
+    # if user provided manual stop pct > 0, override
+    if custom_stop_pct > 0.0:
+        stop_pct = custom_stop_pct / 100.0
+        if pos_type == "long":
+            stop_price = round(entry_price * (1 - stop_pct), 6)
+        else:
+            stop_price = round(entry_price * (1 + stop_pct), 6)
+    else:
+        stop_pct = stop_pct_auto
+        stop_price = stop_price_auto
+
+    stop_line = {"price": stop_price, "type": pos_type, "pct": stop_pct}
+
+    svg = render_candles_svg_with_markers(candles, markers, stop_line=stop_line, width_px=1000, height_px=460, margin=48, show_sma=(20 if show_sma1 else 0, 50 if show_sma2 else 0), rsi_vals=rsi)
     st.components.v1.html(svg, height=520)
 
-    analysis = analyze_candles_full(candles)
-    st.subheader("Analyse")
-    st.write(f"**Empfehlung:** {analysis['recommendation']}")
-    st.write(f"**Risiko:** {analysis['risk']}  •  **Volatilität:** {analysis['volatility']:.6f}")
-    if analysis['reasons']:
+    # analysis block
+    full_analysis = analyze_candles_full(candles)
+    st.subheader("Analyse & Stop-Empfehlung")
+    st.write(f"**Einstieg (letzter Schlusskurs):** {entry_price:.6f}")
+    st.write(f"**Positionstyp:** {pos_type.upper()}  •  **Vorschlag Stop-Loss:** {stop_price:.6f} ({stop_pct*100:.2f}%)")
+    st.write(f"**Volatilität (σ der Returns):** {vol:.6f}")
+    st.write(f"**Empfehlung (Muster-Score):** {full_analysis['recommendation']}  •  Risiko: {full_analysis['risk']}")
+    if full_analysis['reasons']:
         st.write("**Erkannte Muster / Gründe:**")
-        for r in analysis['reasons']:
+        for r in full_analysis['reasons']:
             st.write(f"- {r}")
-    else:
-        st.write("Keine starken Muster erkannt.")
+
+    st.markdown("#### Was ist Stop-Loss / Take-Profit / Short-Position?")
+    st.write("""
+    **Stop-Loss:** Automatische Order, die eine Position bei Erreichen eines Preises schließt, um Verluste zu begrenzen.
+    In dieser App wird der Stop dynamisch aus der Volatilität berechnet:  
+    - Höhere Volatilität → weiter entfernter Stop (mehr Raum),  
+    - Niedrige Volatilität → enger Stop.  
+    **Take-Profit:** Zielpreis, bei dem du Gewinne sicherst (häufig 1.5–3× des Stop-Abstands).
+    **Short-Position:** Du verkaufst zuerst und kaufst später zurück — Profit, wenn der Kurs fällt. Stop-Loss bei Short liegt **über** dem Einstiegsniveau.
+    """)
 
     st.markdown("---")
     st.subheader("Schnellaktionen")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Zum Portfolio hinzufügen"):
-            cur_price = candles[-1]["close"]
-            st.session_state.portfolio.append({"id": asset_id, "name": sel, "qty": add_qty, "buy_price": cur_price, "added_at": datetime.utcnow().isoformat()})
+        if st.button("Zum Portfolio hinzufügen (Einstieg)"):
+            st.session_state.portfolio.append({"id": asset_id, "name": sel, "qty": add_qty, "buy_price": entry_price, "position": pos_type, "stop_price": stop_price, "stop_pct": stop_pct, "added_at": datetime.utcnow().isoformat()})
             with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
                 json.dump(st.session_state.portfolio, f, indent=2, ensure_ascii=False)
-            st.success(f"{sel} ({add_qty}) zum Portfolio hinzugefügt.")
+            st.success(f"{sel} ({add_qty}) als {pos_type} hinzugefügt. Stop: {stop_price:.6f}")
     with c2:
         if st.button("Details anzeigen"):
-            last = candles[-1]; prev = candles[-2] if len(candles)>1 else None
-            st.write("Letzte Kerze:", last); st.write("Vorherige Kerze:", prev)
+            st.write("Letzte Kerze:", candles[-1])
+            st.write("Stop-Loss Vorschlag:", stop_price, f"({stop_pct*100:.2f}%)")
 
     st.markdown("---")
     st.subheader("Portfolio")
@@ -420,11 +477,15 @@ with col_main:
             pid = item.get("id")
             tmp_prices = generate_price_walk(pid + "|p", 20, item.get("buy_price", 100))
             cur_price = tmp_prices[-1]
-            total_value += cur_price * float(item.get("qty", 0.0))
-            st.write(f"- {item['name']} • qty {item['qty']} • buy {item['buy_price']:.2f} • cur est {cur_price:.2f}")
-        st.write(f"**Geschätzter Portfolio-Wert:** {total_value:.2f}")
+            if item.get("position","long") == "long":
+                total_value += cur_price * float(item.get("qty", 0.0))
+            else:
+                # short P&L estimate: (entry - cur) * qty
+                total_value += (item.get("buy_price", cur_price) - cur_price) * float(item.get("qty", 0.0))
+            st.write(f"- {item['name']} • pos {item.get('position','long')} • qty {item['qty']} • entry {item['buy_price']:.6f} • cur est {cur_price:.6f} • stop {item.get('stop_price'):.6f}")
+        st.write(f"**Geschätzter Portfolio-Wert (Longs = Marktwert, Shorts = unreal. P&L):** {total_value:.2f}")
     else:
         st.write("Portfolio leer. Füge Positionen hinzu.")
 
 st.markdown("---")
-st.caption("Offline-Simulator: deterministisch (gleicher Asset-Name → gleiche Serie). SVG-Render mit SMC-Overlays (BOS, POI/LQ, BSL/SSL, Entry/Stop).")
+st.caption("Offline-Simulator — deterministisch (gleicher Asset-Name → gleiche Serie). SVG-Render ohne externe Grafikbibliotheken.")

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 # CONFIG
 # ---------------------
 st.set_page_config(page_title="Analyzer v2.0 — Backtest & Indicators", layout="wide")
-st.title("Analyzer v2.0 — Backtesting, Indicators, Adaptive Stop, Perceptron (Offline-first)")
+st.title("Analyzer v2.0 — Backtesting, Indicators, Adaptive Stop, Perceptron")
 
 # ---------- FILES ----------
 PORTFOLIO_FILE = "portfolio.json"

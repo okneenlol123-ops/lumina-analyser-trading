@@ -1,43 +1,48 @@
 # main.py
-# Analyzer Deluxe Final — Live (Alpha Vantage) + Offline fallback
-# Streamlit-only (kein plotly/matplotlib). SVG candlesticks, pattern detection,
-# adaptive stop-loss, long/short recommendation, backtesting, perceptron-ML,
-# estimated success probability + risk %
+# Analyzer Deluxe Final — Extended with 3-sentence recommendation and Chart Image Analysis page
+# - Uses Alpha Vantage (via st.secrets or in-code ALPHA_KEY)
+# - SVG candlesticks (no plotly/matplotlib)
+# - Optional Pillow-based image analysis (if pillow installed)
+# - Offline fallback simulation if no API / no internet
 #
-# Hinweis: API key ist voreingestellt (wenn du ihn in den Code willst).
-# Es ist sicherer, den Key in Streamlit Secrets zu speichern:
-#   .streamlit/secrets.toml
-#   [api_keys]
-#   ALPHA_KEY = "22XGVO0TQ1UV167C"
-#
-# Wenn du den Key im Code belassen möchtest, setze ALPHA_KEY unten.
+# Save as main.py and run: streamlit run main.py
 
 import streamlit as st
-import json, os, math, random, time, urllib.request, urllib.parse
+import json, os, time, random, math, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 import statistics
+from typing import List, Dict, Any
 
-# -----------------------
-# APP CONFIG
-# -----------------------
-st.set_page_config(page_title="Analyzer Deluxe Final", layout="wide")
-st.title("Analyzer Deluxe — Live (Alpha Vantage) + Offline Fallback")
-
-# -----------------------
-# API KEY (inserted or from secrets)
-# -----------------------
-# You asked to include: 22XGVO0TQ1UV167C
-# If you prefer, move to st.secrets (recommended).
-ALPHA_KEY = "22XGVO0TQ1UV167C"
+# Optional image processing
 try:
-    if not ALPHA_KEY:
-        ALPHA_KEY = st.secrets["api_keys"]["ALPHA_KEY"]
+    from PIL import Image, ImageFilter, ImageOps
+    PIL_AVAILABLE = True
 except Exception:
-    pass
+    PIL_AVAILABLE = False
 
-# -----------------------
+# -------------------------
+# App config
+# -------------------------
+st.set_page_config(page_title="Analyzer Deluxe — Final Extended", layout="wide")
+st.title("Analyzer Deluxe — Final Extended")
+
+# -------------------------
+# API key (preferred in secrets)
+# -------------------------
+# Recommended: put into Streamlit secrets (Manage app → Settings → Secrets)
+# Example secrets.toml:
+# [api_keys]
+# ALPHA_KEY = "22XGVO0TQ1UV167C"
+ALPHA_KEY = None
+try:
+    ALPHA_KEY = st.secrets["api_keys"]["ALPHA_KEY"]
+except Exception:
+    # fall back to none (app will use offline simulation)
+    ALPHA_KEY = ALPHA_KEY
+
+# -------------------------
 # Files / persistence
-# -----------------------
+# -------------------------
 PORTFOLIO_FILE = "portfolio.json"
 HISTORY_FILE = "history.json"
 CACHE_DIR = ".cache_av"
@@ -66,9 +71,9 @@ def save_json(path, obj):
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-# -----------------------
-# Asset lists
-# -----------------------
+# -------------------------
+# Example asset lists
+# -------------------------
 ETFS = [
  "iShares DAX", "SP500 ETF", "MSCI World", "EuroStoxx", "Asia Pacific ETF",
  "Emerging Mkts ETF", "Tech Leaders ETF", "Value ETF", "Dividend ETF", "Global SmallCap"
@@ -84,30 +89,24 @@ CRYPTOS = [
 
 ALL_ASSETS = ETFS + STOCKS + CRYPTOS
 
-# map friendly names to common symbols (best-effort)
 KNOWN_SYMBOLS = {
     "aapl": "AAPL", "msft":"MSFT", "amzn":"AMZN", "tsla":"TSLA", "nvda":"NVDA",
     "googl":"GOOGL", "meta":"META", "btc":"BTC-USD", "bitcoin":"BTC-USD", "eth":"ETH-USD"
 }
 
-# -----------------------
-# util helpers
-# -----------------------
+# -------------------------
+# Utilities
+# -------------------------
 def human_ts():
     return datetime.utcnow().isoformat() + "Z"
 
 def deterministic_seed(s: str) -> int:
     return abs(hash(s)) % (2**31)
 
-# -----------------------
-# Alpha Vantage fetch (no requests req)
-# -----------------------
+# -------------------------
+# Alpha Vantage fetch
+# -------------------------
 def fetch_alpha_intraday(symbol: str, interval: str = "5min", outputsize: str = "compact"):
-    """
-    Returns list of OHLC dicts sorted oldest->newest:
-    [{"t":datetime, "open":, "high":, "low":, "close":, "volume":}, ...]
-    On error returns None.
-    """
     if not ALPHA_KEY:
         return None
     params = {
@@ -151,13 +150,11 @@ def fetch_alpha_intraday(symbol: str, interval: str = "5min", outputsize: str = 
         return None
 
 def cache_path_for(symbol, interval):
-    key = f"{symbol}_{interval}.json"
-    return os.path.join(CACHE_DIR, key)
+    return os.path.join(CACHE_DIR, f"{symbol}_{interval}.json")
 
 def cache_save(symbol, interval, candles):
     path = cache_path_for(symbol, interval)
     try:
-        # convert datetimes to iso
         out = []
         for c in candles:
             o = dict(c)
@@ -191,9 +188,9 @@ def cache_load(symbol, interval, max_age_seconds=3600*24):
     except Exception:
         return None
 
-# -----------------------
-# Offline deterministic generator
-# -----------------------
+# -------------------------
+# Offline generator
+# -------------------------
 def generate_price_walk(seed: str, steps: int, start_price: float = 100.0):
     rnd = random.Random(deterministic_seed(seed))
     price = float(start_price)
@@ -219,9 +216,9 @@ def prices_to_ohlc(prices, candle_size=1):
         ohlc[i]["t"] = now_dt - timedelta(minutes=(len(ohlc)-1-i)*minutes)
     return ohlc
 
-# -----------------------
-# Indicators (SMA, EMA, MACD, RSI, Bollinger)
-# -----------------------
+# -------------------------
+# Indicators
+# -------------------------
 def sma(values, period):
     res = []
     for i in range(len(values)):
@@ -239,7 +236,7 @@ def ema(values, period):
         if ema_prev is None:
             ema_prev = v
         else:
-            ema_prev = v * k + ema_prev * (1.0 - k)
+            ema_prev = v * k + ema_prev * (1 - k)
         res.append(ema_prev)
     return res
 
@@ -251,7 +248,6 @@ def macd(values, fast=12, slow=26, signal=9):
     mac = []
     for a, b in zip(ef, es):
         mac.append((a - b) if (a is not None and b is not None) else None)
-    # compute signal over mac values (filter Nones)
     mac_vals = [v for v in mac if v is not None]
     if not mac_vals:
         return mac, [None]*len(mac), [None]*len(mac)
@@ -297,9 +293,9 @@ def bollinger(values, period=20, mult=2.0):
             res.append((round(m, 6), round(up, 6), round(low, 6)))
     return res
 
-# -----------------------
-# Pattern detection (candles)
-# -----------------------
+# -------------------------
+# Patterns
+# -------------------------
 def is_doji(c):
     body = abs(c["close"] - c["open"])
     total = c["high"] - c["low"]
@@ -330,8 +326,7 @@ def is_three_white_soldiers(candles):
 def detect_markers(candles):
     markers = []
     for i in range(1, len(candles)):
-        cur = candles[i]
-        prev = candles[i-1]
+        cur = candles[i]; prev = candles[i-1]
         if is_bullish_engulfing(prev, cur) or is_hammer(cur):
             markers.append({"idx": i, "type": "buy", "reason": "Bullish/Hammer"})
         if is_bearish_engulfing(prev, cur) or is_shooting_star(cur):
@@ -339,7 +334,6 @@ def detect_markers(candles):
     for i in range(2, len(candles)):
         if is_three_white_soldiers(candles[:i+1]):
             markers.append({"idx": i, "type": "buy", "reason": "Three White Soldiers"})
-    # deduplicate
     seen = set(); uniq = []
     for m in markers:
         k = (m["idx"], m["type"])
@@ -347,14 +341,13 @@ def detect_markers(candles):
             seen.add(k); uniq.append(m)
     return uniq
 
-# -----------------------
-# Stop-loss (dynamic) - volatility based
-# -----------------------
+# -------------------------
+# Stop-loss calc
+# -------------------------
 def calculate_dynamic_stop(entry_price, candles, position_type="long"):
     closes = [c["close"] for c in candles[-30:]] if len(candles) >= 2 else [entry_price]
     returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))] if len(closes) > 1 else [0.0]
     vol = statistics.pstdev(returns) if len(returns) > 0 else 0.0
-    # map vol to percentage (wider for higher vol), clamp 0.5%..15%
     recommended_pct = max(0.005, min(0.15, vol * 3.5))
     if position_type == "long":
         stop_price = entry_price * (1 - recommended_pct)
@@ -362,9 +355,9 @@ def calculate_dynamic_stop(entry_price, candles, position_type="long"):
         stop_price = entry_price * (1 + recommended_pct)
     return round(stop_price, 6), round(recommended_pct, 4), vol
 
-# -----------------------
-# SVG renderer (candles + overlays + markers + stop)
-# -----------------------
+# -------------------------
+# SVG render (candles + overlays)
+# -------------------------
 def render_candles_svg(candles, markers=None, stop_line=None, sma_periods=(20,50), rsi_vals=None, boll=None, width_px=1100, height_px=620):
     if markers is None:
         markers = []
@@ -420,8 +413,7 @@ def render_candles_svg(candles, markers=None, stop_line=None, sma_periods=(20,50
         for i, v in enumerate(vals):
             if v is None:
                 if cur:
-                    segs.append(" ".join(cur))
-                    cur = []
+                    segs.append(" ".join(cur)); cur=[]
             else:
                 x = margin + i*spacing + spacing/2
                 y = y_pos(v)
@@ -454,7 +446,7 @@ def render_candles_svg(candles, markers=None, stop_line=None, sma_periods=(20,50
                 x = margin + i*spacing + spacing/2
                 low_pts.append(f"{x},{y_pos(b[2])}")
         def segs_from(pts):
-            segs = []; cur = []
+            segs = []; cur=[]
             for p in pts:
                 if p is None:
                     if cur: segs.append(cur); cur=[]
@@ -467,7 +459,7 @@ def render_candles_svg(candles, markers=None, stop_line=None, sma_periods=(20,50
             poly = " ".join(u_seg + l_seg[::-1])
             svg.append(f'<polygon points="{poly}" fill="#223333" opacity="0.22" stroke="none" />')
 
-    # markers (shift offsets to reduce overlap)
+    # markers
     shift_px = max(6, min(30, int(200 / max(1, n))))
     used_counts = {}
     for m in markers:
@@ -499,9 +491,9 @@ def render_candles_svg(candles, markers=None, stop_line=None, sma_periods=(20,50
         svg.append(f'<rect x="{width_px-margin-320}" y="{y_sp-16}" width="320" height="20" fill="#101010" opacity="0.9"/>')
         svg.append(f'<text x="{width_px-margin-316}" y="{y_sp-2}" font-size="12" fill="{color}">{label}</text>')
 
-    # RSI
+    # RSI area
     rsi_top = margin + chart_h + 12
-    rsi_h = rsi_vals and int(height_px * 0.16) or 0
+    rsi_h = int(height_px * 0.16)
     if rsi_vals:
         svg.append(f'<rect x="{margin}" y="{rsi_top}" width="{width_px-2*margin}" height="{rsi_h}" fill="#0b0b0b" stroke="#111"/>')
         svg.append(f'<text x="{margin}" y="{rsi_top-4}" font-size="12" fill="#9aa6b2">RSI(14)</text>')
@@ -537,9 +529,9 @@ def render_candles_svg(candles, markers=None, stop_line=None, sma_periods=(20,50
     svg.append('</svg>')
     return "\n".join(svg)
 
-# -----------------------
-# Perceptron (simple)
-# -----------------------
+# -------------------------
+# Simple perceptron model
+# -------------------------
 class SimplePerceptron:
     def __init__(self, n):
         self.n = n
@@ -590,13 +582,12 @@ def load_model():
 def save_model(p):
     save_json(MODEL_FILE, p.export())
 
-# -----------------------
-# Features for ML
-# -----------------------
+# -------------------------
+# Features builder for ML
+# -------------------------
 def features_from_candles(candles):
     closes = [c["close"] for c in candles]
     if len(closes) < 60:
-        # pad
         while len(closes) < 60:
             closes.insert(0, closes[0] if closes else 100.0)
     last = closes[-1]
@@ -614,29 +605,9 @@ def features_from_candles(candles):
     atr = sum([h - l for h, l in zip(highs, lows)]) / len(highs) if highs else 0.0
     return [ret1, sma_diff, rsi_last/100.0, macd_last, vol, atr/last if last != 0 else 0.0]
 
-# -----------------------
+# -------------------------
 # Backtest engine
-# -----------------------
-def calculate_performance_from_trades(trades, equity_curve, initial_cash):
-    total_return = (equity_curve[-1] - initial_cash) / initial_cash if initial_cash else 0.0
-    returns = []
-    for i in range(1, len(equity_curve)):
-        if equity_curve[i-1] != 0:
-            returns.append((equity_curve[i] - equity_curve[i-1]) / equity_curve[i-1])
-    avg_ret = statistics.mean(returns) if returns else 0.0
-    std_ret = statistics.pstdev(returns) if len(returns) > 1 else 0.0
-    sharpe_like = (avg_ret / std_ret) if std_ret != 0 else 0.0
-    peak = equity_curve[0] if equity_curve else initial_cash
-    max_dd = 0.0
-    for v in equity_curve:
-        if v > peak: peak = v
-        dd = (peak - v) / peak if peak > 0 else 0.0
-        if dd > max_dd:
-            max_dd = dd
-    winners = [t for t in trades if t.get("pnl", 0) > 0]
-    winrate = len(winners)/len(trades) if trades else 0.0
-    return {"total_return": total_return, "sharpe_like": sharpe_like, "max_dd": max_dd, "winrate": winrate}
-
+# -------------------------
 def backtest_strategy(candles, strategy_fn, initial_cash=10000.0):
     cash = initial_cash
     position = None
@@ -697,15 +668,36 @@ def backtest_strategy(candles, strategy_fn, initial_cash=10000.0):
             cash += position["qty"] * (position["entry_price"] - price)
         trades.append({**position, "exit_price": price, "exit_index": len(candles)-1, "pnl": pnl})
         equity_curve.append(cash)
-    metrics = calculate_performance_from_trades(trades, equity_curve, initial_cash)
-    metrics["trades"] = trades
-    metrics["equity_curve"] = equity_curve
-    metrics["final_cash"] = cash
-    return metrics
+    total_return = (equity_curve[-1] - initial_cash) / initial_cash if initial_cash else 0.0
+    returns = []
+    for i in range(1, len(equity_curve)):
+        if equity_curve[i-1] != 0:
+            returns.append((equity_curve[i] - equity_curve[i-1]) / equity_curve[i-1])
+    avg_ret = statistics.mean(returns) if returns else 0.0
+    std_ret = statistics.pstdev(returns) if len(returns) > 1 else 0.0
+    sharpe_like = (avg_ret / std_ret) if std_ret != 0 else 0.0
+    peak = equity_curve[0] if equity_curve else initial_cash
+    max_dd = 0.0
+    for v in equity_curve:
+        if v > peak: peak = v
+        dd = (peak - v) / peak if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd = dd
+    winners = [t for t in trades if t.get("pnl", 0) > 0]
+    winrate = len(winners)/len(trades) if trades else 0.0
+    return {
+        "trades": trades,
+        "equity_curve": equity_curve,
+        "total_return": total_return,
+        "sharpe_like": sharpe_like,
+        "max_dd": max_dd,
+        "winrate": winrate,
+        "final_cash": cash
+    }
 
-# -----------------------
-# Strategy examples
-# -----------------------
+# -------------------------
+# Strategies
+# -------------------------
 def strategy_sma_cross(candles, i):
     closes = [c["close"] for c in candles[:i+1]]
     if len(closes) < 51:
@@ -733,11 +725,10 @@ def strategy_macd_momentum(candles, i):
         return -1
     return 0
 
-# -----------------------
-# Analysis & success estimate
-# -----------------------
+# -------------------------
+# Analysis + success estimate + 3-sentence summary
+# -------------------------
 def analyze_and_estimate(candles, perceptron_model):
-    # produce signals from rules
     markers = detect_markers(candles)
     closes = [c["close"] for c in candles]
     s20 = sma(closes, 20)
@@ -745,47 +736,67 @@ def analyze_and_estimate(candles, perceptron_model):
     macd_line, macd_sig, macd_hist = macd(closes, 12, 26, 9)
     rsi_vals = rsi(closes, 14)
     boll = bollinger(closes, 20, 2.0)
-    # determine simple rule-based recommendation
+
     score = 0
     last = candles[-1]
     prev = candles[-2] if len(candles) > 1 else None
-    if is_hammer(last): score += 1
-    if prev and is_bullish_engulfing(prev, last): score += 2
-    if is_three_white_soldiers(candles): score += 2
-    if is_shooting_star(last): score -= 1
-    if prev and is_bearish_engulfing(prev, last): score -= 2
-    # sma trend
+    reasons = []
+    if is_hammer(last):
+        score += 1; reasons.append("Hammer erkannt (Bullish-Signal)")
+    if prev and is_bullish_engulfing(prev, last):
+        score += 2; reasons.append("Bullish Engulfing (starkes Kaufsignal)")
+    if is_three_white_soldiers(candles):
+        score += 2; reasons.append("Three White Soldiers (Bestätigung eines Aufwärtstrends)")
+    if is_shooting_star(last):
+        score -= 1; reasons.append("Shooting Star (Bärisches Signal)")
+    if prev and is_bearish_engulfing(prev, last):
+        score -= 2; reasons.append("Bearish Engulfing (starkes Verkaufssignal)")
+
     if s20[-1] and s50[-1]:
         if s20[-1] > s50[-1]:
-            score += 1
+            score += 1; reasons.append("SMA20 über SMA50 (bullisch)")
         else:
-            score -= 1
-    # macd momentum
+            score -= 1; reasons.append("SMA20 unter SMA50 (bärisch)")
+
     if macd_line and macd_sig and macd_line[-1] is not None and macd_sig[-1] is not None:
         if macd_line[-1] > macd_sig[-1]:
-            score += 1
+            score += 1; reasons.append("MACD über Signal (Momentum positiv)")
         else:
-            score -= 1
-    # perceptron model predicts +1 or -1
+            score -= 1; reasons.append("MACD unter Signal (Momentum negativ)")
+
     feat = features_from_candles(candles)
     ml_signal = perceptron_model.predict(feat) if perceptron_model else 0
-    # blend signals
-    base_prob = 0.5 + (score / 8.0)  # score roughly -6..+6 -> scale
-    ml_bias = 0.15 * (1 if ml_signal == 1 else -1)
+
+    base_prob = 0.5 + (score / 10.0)  # scale smaller for safety
+    ml_bias = 0.12 * (1 if ml_signal == 1 else -1)
     prob = min(max(base_prob + ml_bias, 0.01), 0.99)
-    # if backtest info available from previous runs, we could blend with winrate, but we'll produce estimate
-    # risk pct from volatility-based stop of last close
     stop_price, stop_pct, vol = calculate_dynamic_stop(closes[-1], candles, position_type="long")
     risk_pct = stop_pct * 100.0
-    # Recommendation: if prob > 0.65 -> buy/long, if prob < 0.35 -> short, else hold
+
     if prob >= 0.65:
         rec = "Kaufen (Long erwartet zu steigen)"
     elif prob <= 0.35:
-        rec = "Short / Verkaufen (Erwarteter Fall — verkaufen oder short gehen)"
+        rec = "Short / Verkaufen (Erwarteter Fall — Short möglich)"
     else:
         rec = "Halten / Beobachten"
-    # map to "success rate approx 80%" style: we present prob as percentage
+
     success_est = round(prob * 100.0, 1)
+
+    # 3-sentence summary
+    sents = []
+    if rec.startswith("Kaufen"):
+        sents.append(f"Der Algorithmus erkennt überwiegend bullishe Signale ({len(reasons)} Indikatoren).")
+        sents.append(f"Empfohlener Stop-Loss liegt bei ~{round(risk_pct,2)}% unter dem aktuellen Kurs.")
+        sents.append("Tipp: Klein anfangen, Stop setzen, und bei Bestätigung (Volumen/Follow-through) nachlegen.")
+    elif rec.startswith("Short"):
+        sents.append("Der Algorithmus erkennt überwiegend bärische Signale — Vorsicht.")
+        sents.append(f"Empfohlener Stop-Loss liegt bei ~{round(risk_pct,2)}% über dem aktuellen Kurs.")
+        sents.append("Tipp: Erwäge Short oder Absicherung; begrenze Positionsgröße und nutze strikte Stops.")
+    else:
+        sents.append("Kein klares Signal — Markt ist unentschieden.")
+        sents.append("Behalte Volumen, RSI und SMA-Kreuzungen im Auge.")
+        sents.append("Tipp: Warte auf klares Setup (z. B. SMA-Breakout oder bestätigte Pattern).")
+
     return {
         "markers": markers,
         "sma20": s20,
@@ -797,198 +808,359 @@ def analyze_and_estimate(candles, perceptron_model):
         "success_pct": success_est,
         "risk_pct": round(risk_pct, 2),
         "prob": prob,
-        "ml_signal": ml_signal
+        "ml_signal": ml_signal,
+        "reasons": reasons,
+        "summary_sentences": sents
     }
 
-# -----------------------
-# UI + Main
-# -----------------------
-if "portfolio" not in st.session_state:
-    st.session_state.portfolio = load_json(PORTFOLIO_FILE) or []
+# -------------------------
+# Image analysis (optional, requires PIL)
+# -------------------------
+def analyze_uploaded_chart(image_bytes):
+    """
+    Perform a simple image analysis using PIL (if available).
+    Returns detected patterns (estimated) and a short text recommendation.
+    If PIL not available, return None.
+    """
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        img = Image.open(image_bytes).convert("L")  # grayscale
+        # basic preprocessing: resize for speed
+        w, h = img.size
+        maxw = 1200
+        if w > maxw:
+            img = img.resize((maxw, int(h * maxw / w)))
+            w, h = img.size
+        # edge detection
+        edges = img.filter(ImageFilter.FIND_EDGES).point(lambda p: 255 if p > 30 else 0)
+        bbox = edges.getbbox()
+        # compute average brightness
+        hist = img.histogram()
+        total = sum(hist)
+        mean_brightness = sum(i * hist[i] for i in range(256)) / total if total > 0 else 128
+        # simple heuristics: if many vertical edges -> many candles; detect peaks by vertical projection
+        # vertical projection
+        pix = img.load()
+        col_sums = []
+        for x in range(w):
+            s = 0
+            for y in range(h):
+                s += 255 - pix[x, y]  # darker -> higher
+            col_sums.append(s)
+        # find peaks in col_sums
+        peaks = []
+        for i in range(2, len(col_sums)-2):
+            if col_sums[i] > col_sums[i-1] and col_sums[i] > col_sums[i+1] and col_sums[i] > (sum(col_sums)/len(col_sums))*1.5:
+                peaks.append(i)
+        # heuristics for patterns:
+        patterns = []
+        if len(peaks) > 3 and mean_brightness < 120:
+            patterns.append("Candlestick-Chart erkannt")
+        if len(peaks) >= 6:
+            # check for W pattern: look for two local lows
+            # naive approach: find local minima in col_sums
+            minima = []
+            for i in range(2, len(col_sums)-2):
+                if col_sums[i] < col_sums[i-1] and col_sums[i] < col_sums[i+1]:
+                    minima.append(i)
+            if len(minima) >= 2:
+                # if two minima separated by moderate gap, mark W-like
+                for j in range(len(minima)-1):
+                    if 10 < minima[j+1] - minima[j] < 200:
+                        patterns.append("Double Bottom / W-Pattern möglich")
+                        break
+        # brightness-based heuristic for trend: darker right side -> downtrend
+        right_mean = sum(img.crop((w//2,0,w,h)).getdata()) / (w//2 * h)
+        left_mean = sum(img.crop((0,0,w//2,h)).getdata()) / (w//2 * h)
+        trend = "Seitwärts"
+        if right_mean < left_mean - 5:
+            trend = "Abwärtstrend"
+        elif right_mean > left_mean + 5:
+            trend = "Aufwärtstrend"
+        # build recommendation
+        rec_text = []
+        if "Double Bottom / W-Pattern möglich" in patterns:
+            rec_text.append("Mögliches W/Double-Bottom — Umschwung möglich, Long-Setup.")
+        if trend == "Aufwärtstrend":
+            rec_text.append("Chart zeigt Aufwärtstrend — Long bevorzugen.")
+        elif trend == "Abwärtstrend":
+            rec_text.append("Chart zeigt Abwärtstrend — Short oder Vorsicht empfohlen.")
+        if not rec_text:
+            rec_text.append("Kein klares Muster erkennbar — manuelle Kontrolle empfohlen.")
+        return {"patterns": patterns, "trend": trend, "notes": rec_text, "peaks": len(peaks), "brightness": mean_brightness}
+    except Exception:
+        return None
 
-if "history" not in st.session_state:
-    st.session_state.history = load_json(HISTORY_FILE) or []
+# -------------------------
+# Main UI: pages
+# -------------------------
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Seite wählen", ["Marktplatz (Charts)","Portfolio","Bild-Analyse","Backtest & ML","Einstellungen","Hilfe"])
 
-if "cache" not in st.session_state:
-    st.session_state.cache = {}
+# quick internet check
+def internet_ok():
+    try:
+        urllib.request.urlopen("https://www.google.com", timeout=3)
+        return True
+    except Exception:
+        return False
 
-if "model" not in st.session_state:
-    st.session_state.model = load_model()
+online = internet_ok() and bool(ALPHA_KEY)
+if not internet_ok():
+    st.sidebar.error("❌ Keine Internetverbindung — Offline-Fallback aktiv")
+elif not ALPHA_KEY:
+    st.sidebar.warning("⚠️ API-Key nicht gesetzt — Offline-Fallback aktiv")
+else:
+    st.sidebar.success("✅ Live-Mode möglich (Alpha Vantage)")
 
-left_col, right_col = st.columns([3, 1])
-with right_col:
-    st.header("Kontrollen")
-    symbol_in = st.text_input("Symbol oder Asset-Name", value="AAPL")
-    interval = st.selectbox("Intervall", ["1min","5min","15min","30min","60min"], index=1)
-    periods = st.slider("Anzahl Kerzen", 30, 1000, 240, step=10)
-    start_price = st.number_input("Startpreis (Fallback)", value=100.0, step=0.1)
-    use_live = st.checkbox("Live via Alpha Vantage (wenn Key & Limit ok)", value=True)
-    fetch_live = st.button("Fetch Live / Refresh")
-    refresh_sim = st.button("Refresh Simulation")
-    custom_manual_stop = st.slider("Manueller Stop-Loss (%) (0 = auto)", 0.0, 20.0, 0.0, step=0.1)
-    st.markdown("---")
-    st.subheader("Model / ML")
-    if st.button("Train Perceptron (synthetic)"):
-        st.info("Training Perceptron on simulated labeled patterns...")
-        X=[]; y=[]
-        for i in range(800):
-            base = generate_price_walk("train"+str(i), 300, 100.0)
-            ohlc = prices_to_ohlc(base, candle_size=5)
-            label = random.choice([1, -1])
-            if label == 1:
-                # enforce bullish end
-                for k in range(3):
-                    ohlc[-1-k]["open"] = ohlc[-1-k]["close"] * (1 - random.uniform(0.01,0.03))
-                    ohlc[-1-k]["close"] = ohlc[-1-k]["open"] * (1 + random.uniform(0.01,0.05))
-            else:
-                for k in range(3):
-                    ohlc[-1-k]["open"] = ohlc[-1-k]["close"] * (1 + random.uniform(0.01,0.04))
-                    ohlc[-1-k]["close"] = ohlc[-1-k]["open"] * (1 - random.uniform(0.01,0.05))
-            feat = features_from_candles(ohlc)
-            X.append(feat); y.append(label)
-        p = SimplePerceptron(len(X[0]))
-        p.train(X, y, epochs=80)
-        save_model(p)
-        st.session_state.model = p
-        st.success("Perceptron trained and saved.")
-    st.markdown("---")
-    st.subheader("Portfolio")
-    add_qty = st.number_input("Menge für Schnellkauf", value=1.0, min_value=0.0, step=0.1)
-    if st.button("Export Portfolio"):
-        st.download_button("Download JSON", data=json.dumps(st.session_state.portfolio, ensure_ascii=False, indent=2), file_name="portfolio.json", mime="application/json")
-    if st.button("Clear Portfolio"):
-        st.session_state.portfolio = []
-        save_json(PORTFOLIO_FILE, st.session_state.portfolio)
-        st.success("Portfolio geleert")
-    st.markdown("---")
-    st.write("AlphaV key:", "vorhanden" if ALPHA_KEY else "nicht gesetzt")
-    st.write("Hinweis: Alpha Vantage free tier: 5 calls/min, 500 calls/day.")
-
-with left_col:
-    st.header("Chart & Analyzer")
-    sym = symbol_in.strip()
-    # map known friendly names
+# -------------------------
+# Helper: get candles (live or simulated)
+# -------------------------
+def get_candles_for(symbol: str, interval: str, periods: int, start_price: float, use_live: bool):
+    sym = symbol.strip()
     if sym.lower() in KNOWN_SYMBOLS:
-        sym_for_api = KNOWN_SYMBOLS[sym.lower()]
-    else:
-        sym_for_api = sym
-    cache_key = f"{sym_for_api}|{interval}|{periods}|{start_price}"
-    candles = None
-    used_live = False
-
-    if fetch_live and use_live and ALPHA_KEY:
-        fetched = fetch_alpha_intraday(sym_for_api, interval=interval, outputsize="compact")
+        sym = KNOWN_SYMBOLS[sym.lower()]
+    # try live
+    if use_live and ALPHA_KEY and online:
+        fetched = fetch_alpha_intraday(sym, interval=interval, outputsize="compact")
         if fetched and len(fetched) >= periods:
             candles = fetched[-periods:]
-            cache_save(sym_for_api, interval, candles)
-            used_live = True
-            st.success("Live-Daten geladen (Alpha Vantage).")
-        else:
-            st.warning("Live-Fetch fehlgeschlagen oder zu wenig Daten — fallback auf Cache/Simulation.")
-            cached = cache_load(sym_for_api, interval)
-            if cached and len(cached) >= periods:
-                candles = cached[-periods:]
-                st.info("Verwende gecachte Live-Daten.")
-    if not candles:
-        cached = cache_load(sym_for_api, interval)
-        if cached and len(cached) >= periods and not refresh_sim:
-            candles = cached[-periods:]
-            st.info("Verwende zwischengespeicherte Daten.")
-    if not candles or refresh_sim:
-        # deterministic simulation
-        tf_map = {"1min":1, "5min":5, "15min":15, "30min":30, "60min":60}
-        mins = periods * tf_map.get(interval, 5)
-        prices = generate_price_walk(sym_for_api + "|" + interval, mins, start_price)
-        ohlc = prices_to_ohlc(prices, candle_size=tf_map.get(interval, 5))
-        if len(ohlc) < periods:
-            pad = periods - len(ohlc)
-            pad_item = ohlc[0] if ohlc else {"open": start_price, "high": start_price, "low": start_price, "close": start_price, "volume":0}
-            ohlc = [pad_item]*pad + ohlc
-        candles = ohlc[-periods:]
-        st.session_state.cache[cache_key] = candles
-        if refresh_sim:
-            st.success("Simulation neu erzeugt.")
-
-    # compute indicators
-    closes = [c["close"] for c in candles]
-    sma20 = sma(closes, 20)
-    sma50 = sma(closes, 50)
-    macd_line, macd_sig, macd_hist = macd(closes, 12, 26, 9)
-    rsi_vals = rsi(closes, 14)
-    boll = bollinger(closes, 20, 2.0)
-    markers = detect_markers(candles)
-
-    # analysis & estimate
-    model = st.session_state.model
-    analysis = analyze_and_estimate(candles, model)
-    stop_auto, stop_pct_auto, vol = calculate_dynamic_stop(closes[-1], candles, position_type="long")
-    if custom_manual_stop > 0.0:
-        manual_pct = custom_manual_stop/100.0
-        stop_line = {"price": round(closes[-1] * (1 - manual_pct), 6), "type": "long", "pct": manual_pct}
+            cache_save(sym, interval, candles)
+            return candles, True
+        # if fetch failed, try cache
+        cached = cache_load(sym, interval)
+        if cached and len(cached) >= periods:
+            return cached[-periods:], False
+        # else fall back to simulation
     else:
-        stop_line = {"price": stop_auto, "type": "long", "pct": stop_pct_auto}
+        # try cache
+        cached = cache_load(sym, interval)
+        if cached and len(cached) >= periods:
+            return cached[-periods:], False
+    # deterministic sim
+    tf_map = {"1min":1, "5min":5, "15min":15, "30min":30, "60min":60}
+    mins = periods * tf_map.get(interval, 5)
+    prices = generate_price_walk(sym + "|" + interval, mins, start_price)
+    ohlc = prices_to_ohlc(prices, candle_size=tf_map.get(interval, 5))
+    if len(ohlc) < periods:
+        pad = periods - len(ohlc)
+        pad_item = ohlc[0] if ohlc else {"open":start_price,"high":start_price,"low":start_price,"close":start_price,"volume":0}
+        ohlc = [pad_item]*pad + ohlc
+    return ohlc[-periods:], False
 
-    # render svg
-    svg = render_candles_svg(candles, markers=analysis["markers"], stop_line=stop_line, sma_periods=(20,50), rsi_vals=analysis["rsi"], boll=analysis["boll"], width_px=1100, height_px=620)
-    st.components.v1.html(svg, height=640)
-
-    # results
-    st.subheader("Empfehlung & Schätzung")
-    st.markdown(f"**Empfehlung:** {analysis['recommendation']}")
-    st.markdown(f"**Geschätzte Erfolgswahrscheinlichkeit:** **{analysis['success_pct']}%**  (Schätzung, keine Garantie)")
-    st.markdown(f"**Risiko (empf. Stop-Loss-Abstand):** **{analysis['risk_pct']}%**")
-    st.markdown(f"**ML-Signal (Perceptron):** {'BUY' if analysis['ml_signal']==1 else 'SELL' if analysis['ml_signal']==-1 else 'NEUTRAL'}")
-    if analysis.get("reasons"):
-        st.write("Gründe / erkannte Muster:")
-        for r in analysis.get("reasons", []):
-            st.write("- " + r)
-    # quick info about stop-loss / explanation
-    st.markdown("**Was ist Stop-Loss?**")
-    st.write("Stop-Loss ist eine automatische Order, die deine Position schließt, um Verluste zu begrenzen. Hier wird der Stop basierend auf der kurzfristigen Volatilität empfohlen.")
-    st.markdown("---")
-
-    # quick trade simulator / add to portfolio
-    st.subheader("Schnellaktionen")
-    c1, c2 = st.columns(2)
-    with c1:
-        qty = st.number_input("Menge (für Trade)", min_value=0.0, value=add_qty if 'add_qty' in locals() else 1.0, step=0.1)
-        if st.button("Sim. Trade eröffnen (Market)"):
-            entry = closes[-1]
-            direction = 1 if analysis["prob"] >= 0.5 else -1
-            dir_str = "long" if direction==1 else "short"
-            stop = stop_line["price"]
-            tp = round(entry + (entry - stop) * 2, 6) if direction==1 else round(entry - (stop - entry) * 2, 6)
-            trade = {"id": f"sim_{int(time.time())}", "symbol": sym_for_api, "direction": dir_str, "qty": qty, "entry": entry, "stop": stop, "tp": tp, "opened": human_ts()}
-            st.session_state.portfolio.append(trade)
-            save_json(PORTFOLIO_FILE, st.session_state.portfolio)
-            st.success(f"Simulierter Trade: {dir_str} {sym_for_api} qty {qty} entry {entry:.6f} stop {stop:.6f} tp {tp:.6f}")
-    with c2:
-        if st.button("Zum Portfolio hinzufügen (nur Speicherung)"):
-            item = {"symbol": sym_for_api, "qty": qty, "entry": closes[-1], "position": "auto", "stop": stop_line["price"], "added": human_ts()}
-            st.session_state.portfolio.append(item)
-            save_json(PORTFOLIO_FILE, st.session_state.portfolio)
+# -------------------------
+# Page: Marktplatz (Charts)
+# -------------------------
+if page == "Marktplatz (Charts)":
+    st.header("Marktplatz — Charts & Analyzer")
+    left, right = st.columns([3,1])
+    with right:
+        st.subheader("Einstellungen")
+        asset_input = st.text_input("Symbol oder Asset-Name", value="AAPL")
+        interval = st.selectbox("Intervall", ["1min","5min","15min","30min","60min"], index=1)
+        periods = st.slider("Anzahl Kerzen", 30, 800, 240, step=10)
+        start_price = st.number_input("Startpreis (Fallback)", value=100.0, step=0.1)
+        use_live = st.checkbox("Live via Alpha Vantage (wenn Key & online)", value=True)
+        if st.button("Lade / Aktualisiere"):
+            st.experimental_rerun()
+        st.markdown("---")
+        st.subheader("Kurzaktionen")
+        add_qty = st.number_input("Menge (Schnellkauf)", value=1.0, step=0.1)
+        if st.button("Aktuelle Position speichern"):
+            item = {"symbol": asset_input, "qty": add_qty, "entry": None, "added": human_ts()}
+            st.session_state.setdefault("portfolio", load_json(PORTFOLIO_FILE) or []).append(item)
+            save_json(PORTFOLIO_FILE, st.session_state["portfolio"])
             st.success("Position gespeichert.")
 
-    st.markdown("---")
-    st.subheader("Portfolio (Sim / Saved)")
-    if st.session_state.portfolio:
-        total_est = 0.0
-        for t in st.session_state.portfolio:
-            pid = str(t.get("symbol", t.get("id", "X")))
-            tmp_prices = generate_price_walk(pid + "|p", 24, t.get("entry", closes[-1]))
-            cur = tmp_prices[-1]
-            if t.get("direction","long") == "long" or t.get("position","long") == "long":
-                val = cur * t.get("qty", 0.0)
-                pnl = (cur - t.get("entry", cur)) * t.get("qty", 0.0)
-            else:
-                val = (t.get("entry", cur) - cur) * t.get("qty", 0.0)
-                pnl = (t.get("entry", cur) - cur) * t.get("qty", 0.0)
-            total_est += val
-            st.write(f"- {t.get('symbol')} | qty {t.get('qty')} | entry {t.get('entry'):.6f} | cur est {cur:.6f} | P&L {pnl:.4f}")
-        st.write(f"Geschätzter Portfoliowert (sim): {total_est:.2f}")
+    with left:
+        candles, live_flag = get_candles_for(asset_input, interval, periods, start_price, use_live)
+        closes = [c["close"] for c in candles]
+        model = st.session_state.get("model", load_model())
+        analysis = analyze_and_estimate(candles, model)
+        stop_auto, stop_pct_auto, vol = calculate_dynamic_stop(closes[-1], candles, position_type="long")
+        stop_line = {"price": stop_auto, "type":"long", "pct": stop_pct_auto}
+        svg = render_candles_svg(candles, markers=analysis["markers"], stop_line=stop_line, sma_periods=(20,50), rsi_vals=analysis["rsi"], boll=analysis["boll"], width_px=1100, height_px=620)
+        st.components.v1.html(svg, height=640)
+        st.subheader("Empfehlung & Kurzbeschreibung")
+        st.markdown(f"**Empfehlung:** {analysis['recommendation']}")
+        st.markdown(f"**Geschätzte Erfolgswahrscheinlichkeit:** **{analysis['success_pct']}%**")
+        st.markdown(f"**Risiko (Stop-Loss Abstand):** **{analysis['risk_pct']}%**")
+        st.markdown("**Kurzbeschreibung (3 Sätze):**")
+        for s in analysis["summary_sentences"]:
+            st.write("- " + s)
+        st.markdown("---")
+        st.write("Erklärungen / erkannte Gründe:")
+        for r in analysis["reasons"]:
+            st.write("- " + r)
+        st.write("ML-Signal:", "BUY" if analysis["ml_signal"]==1 else "SELL" if analysis["ml_signal"]==-1 else "NEUTRAL")
+        if live_flag:
+            st.info("Live-Daten verwendet (Alpha Vantage).")
+        else:
+            st.info("Offline-Simulation oder Cache verwendet.")
+
+# -------------------------
+# Page: Portfolio
+# -------------------------
+elif page == "Portfolio":
+    st.header("Portfolio")
+    port = st.session_state.get("portfolio", load_json(PORTFOLIO_FILE) or [])
+    if not port:
+        st.info("Portfolio leer.")
     else:
-        st.info("Portfolio leer — füge simulierte Trades hinzu.")
+        total = 0.0
+        for p in port:
+            st.write(p)
+        if st.button("Export Portfolio"):
+            st.download_button("Herunterladen", data=json.dumps(port, ensure_ascii=False, indent=2), file_name="portfolio.json")
+        if st.button("Clear Portfolio"):
+            st.session_state["portfolio"] = []
+            save_json(PORTFOLIO_FILE, st.session_state["portfolio"])
+            st.success("Portfolio geleert.")
+
+# -------------------------
+# Page: Bild-Analyse
+# -------------------------
+elif page == "Bild-Analyse":
+    st.header("Chart-Bild-Analyse")
+    st.markdown("Lade einen Chart-Screenshot hoch — die App versucht, Muster zu erkennen und eine Empfehlung zu geben.")
+    uploaded = st.file_uploader("Bild hochladen (PNG, JPG)", type=["png","jpg","jpeg"])
+    if uploaded is None:
+        st.info("Kein Bild hochgeladen. Wenn Pillow fehlt, installiere `pillow` in requirements.txt um automatische Analyse zu aktivieren.")
+        if not PIL_AVAILABLE:
+            st.warning("Bildanalyse deaktiviert: Pillow (PIL) nicht installiert. Füge `pillow` zu requirements.txt hinzu.")
+            st.markdown("Beispiel `requirements.txt` Eintrag:\n```\npillow\nstreamlit\n```")
+    else:
+        # display image
+        st.image(uploaded, use_column_width=True)
+        if not PIL_AVAILABLE:
+            st.error("Automatische Bildanalyse nicht verfügbar (Pillow fehlt). Du kannst das Chart manuell taggen.")
+            tag = st.selectbox("Manuelle Muster-Auswahl", ["Kein Muster","Hammer","Doji","Engulfing (bull)","Engulfing (bear)","Double Top","Double Bottom","Head & Shoulders"])
+            notes = st.text_area("Zusätzliche Notiz (optional)")
+            if st.button("Analyse speichern / Empfehlung anzeigen"):
+                # simple mapping
+                map_rec = {
+                    "Hammer": ("Kaufen", "Hammer an Unterstützungszone - mögliches Reversal", "Setze Stop knapp unter Low"),
+                    "Doji": ("Beobachten", "Unentschieden — Volumen prüfen", "Warte auf Bestätigung"),
+                    "Engulfing (bull)": ("Kaufen", "Bullish Engulfing — starkes Kaufsignal", "Stop setzen, kleines Volumen kann täuschen"),
+                    "Engulfing (bear)": ("Short", "Bearish Engulfing — Verkaufssignal", "Stop oberhalb des Hochs"),
+                    "Double Top": ("Short", "Double Top — möglicher Trendwechsel", "Bestätigen lassen"),
+                    "Double Bottom": ("Kaufen", "Double Bottom — Reversal möglich", "Stop unter dem Tief"),
+                    "Head & Shoulders": ("Short", "H&S — meist bärisch", "Vorsicht, warten auf Nackenlinienbruch"),
+                    "Kein Muster": ("Halten", "Kein eindeutiges Muster erkannt", "Weitere Analyse erforderlich")
+                }
+                rec, expl, tip = map_rec.get(tag, ("Halten","Kein klares Muster","Keine Aktion"))
+                st.success(f"Empfehlung: {rec}")
+                st.write(expl); st.write(tip)
+        else:
+            # perform analysis
+            res = analyze_uploaded_chart(uploaded)
+            if not res:
+                st.error("Analyse fehlgeschlagen oder Bildformat nicht lesbar.")
+            else:
+                st.subheader("Bild-Analyse Ergebnis")
+                st.write("Erkannte Muster (heuristisch):", res.get("patterns", []))
+                st.write("Trend (heuristisch):", res.get("trend"))
+                st.write("Notizen / Empfehlung:")
+                for n in res.get("notes", []):
+                    st.write("- " + n)
+                st.write(f"Peaks detected: {res.get('peaks')}, Brightness: {res.get('brightness'):.1f}")
+
+# -------------------------
+# Page: Backtest & ML
+# -------------------------
+elif page == "Backtest & ML":
+    st.header("Backtest & Perceptron ML")
+    left, right = st.columns([3,1])
+    with right:
+        strategy = st.selectbox("Strategie zum Backtesten", ["SMA Crossover", "MACD Momentum"])
+        initial_cash = st.number_input("Initial Cash", value=10000.0, step=100.0)
+        run_bt = st.button("Backtest ausführen")
+        if st.button("Train Perceptron (synthetic)"):
+            st.info("Training Perceptron mit synthetischen Mustern...")
+            X=[]; y=[]
+            for i in range(700):
+                base = generate_price_walk("train"+str(i), 300, 100.0)
+                ohlc = prices_to_ohlc(base, candle_size=5)
+                label = random.choice([1, -1])
+                if label == 1:
+                    for k in range(3):
+                        ohlc[-1-k]["open"] = ohlc[-1-k]["close"] * (1 - random.uniform(0.01,0.03))
+                        ohlc[-1-k]["close"] = ohlc[-1-k]["open"] * (1 + random.uniform(0.01,0.05))
+                else:
+                    for k in range(3):
+                        ohlc[-1-k]["open"] = ohlc[-1-k]["close"] * (1 + random.uniform(0.01,0.04))
+                        ohlc[-1-k]["close"] = ohlc[-1-k]["open"] * (1 - random.uniform(0.01,0.05))
+                feat = features_from_candles(ohlc)
+                X.append(feat); y.append(label)
+            p = SimplePerceptron(len(X[0]))
+            p.train(X, y, epochs=80)
+            save_model(p)
+            st.session_state["model"] = p
+            st.success("Perceptron trained and saved.")
+    with left:
+        symbol_bt = st.text_input("Symbol für Backtest", value="AAPL")
+        interval_bt = st.selectbox("Interval", ["5min","15min","30min","60min"], index=1)
+        periods_bt = st.slider("Kerzen für Backtest", 100, 2000, 500, step=50)
+        start_price_bt = st.number_input("Startpreis (fallback)", value=100.0, step=0.1)
+        use_live_bt = st.checkbox("Live-Daten falls verfügbar", value=False)
+        if run_bt:
+            candles_bt, live_flag = get_candles_for(symbol_bt, interval_bt, periods_bt, start_price_bt, use_live_bt)
+            strat_fn = strategy_sma_cross if strategy == "SMA Crossover" else strategy_macd_momentum
+            res = backtest_strategy(candles_bt, strat_fn, initial_cash=initial_cash)
+            st.subheader("Backtest Ergebnisse")
+            st.write(f"Total Return: {res['total_return']*100:.2f}%")
+            st.write(f"Sharpe-like: {res['sharpe_like']:.4f}")
+            st.write(f"Max Drawdown: {res['max_dd']*100:.2f}%")
+            st.write(f"Winrate: {res['winrate']*100:.2f}%")
+            if res.get("trades"):
+                st.write("Trades (erste 10):")
+                for t in res["trades"][:10]:
+                    st.write(t)
+            st.line_chart(res["equity_curve"])
+            if live_flag:
+                st.info("Live-Daten verwendet (Alpha Vantage).")
+            else:
+                st.info("Offline-Simulation verwendet.")
+
+# -------------------------
+# Page: Einstellungen
+# -------------------------
+elif page == "Einstellungen":
+    st.header("Einstellungen")
+    st.markdown("Einstellungen & Cache-Verwaltung")
+    if st.button("Cache leeren"):
+        for f in os.listdir(CACHE_DIR):
+            try:
+                os.remove(os.path.join(CACHE_DIR, f))
+            except Exception:
+                pass
+        st.success("Cache geleert.")
+    st.markdown("---")
+    st.write("Pillow installiert:" , "Ja" if PIL_AVAILABLE else "Nein")
+    if not PIL_AVAILABLE:
+        st.info("Für automatische Bildanalyse installiere `pillow` in requirements.txt (z. B. 'pillow').")
+
+# -------------------------
+# Page: Hilfe
+# -------------------------
+elif page == "Hilfe":
+    st.header("Hilfe & Hinweise")
+    st.markdown("""
+    **Wichtige Hinweise**
+    - Alpha Vantage Free Tier: maximal ~5 API-Calls pro Minute. Die App cached Antworten in `.cache_av`.
+    - Die Erfolgswahrscheinlichkeit ist eine Schätzung — keine Anlageberatung.
+    - Wenn du Bildanalyse möchtest, installiere Pillow in requirements.
+    - Empfohlen: Lege deinen API-Key in Streamlit Secrets (Manage app → Settings → Secrets).
+    """)
+    st.markdown("**Wenn du Probleme mit fehlenden Modulen hast:**")
+    st.code("requirements.txt\nstreamlit\n# optional\npillow\n")
+    st.markdown("---")
+    st.markdown("**Was ich als Nächstes verbessern kann (Vorschläge):**")
+    st.write("- Gebühren & Slippage ins Backtestmodell einbauen")
+    st.write("- Besseres ML-Modell (LightGBM / sklearn) — braucht zusätzliche libs")
+    st.write("- Besserer Bild-Analyzer mit CNN (benötigt TensorFlow/PyTorch)")
 
 # Footer
 st.markdown("---")
-st.caption("Analyzer Deluxe Final — Live via Alpha Vantage when available; otherwise deterministic offline simulation. Erfolgswahrscheinlichkeit ist eine Schätzung basierend auf Muster-Score und ML-Signal — keine Anlageberatung.")
+st.caption("Analyzer Deluxe Extended — Live via Alpha Vantage if configured; otherwise deterministic offline simulation. Recommendations are estimates and not financial advice.")

@@ -1,37 +1,46 @@
 # main.py
-# Lumina Pro — Kombinierter Live & Bild Analyzer (Finnhub + Roboflow)
-# Keys direkt im Code (Benutzerwunsch)
+# Lumina Pro — Upgraded Daytrading Analyzer + Offline Image-Structure Analyzer
+# - Offline image analyzer: erkennt Strukturen & Muster nur aus dem Bild (Pillow)
+# - Live analyzer: Finnhub integration for real candles (Key embedded)
+# - Dark theme, SVG candle renderer, decision logic, feedback card like screenshot
+#
+# Requirements:
+#   pip install streamlit pillow
+#
+# Keys (embedded per user request)
 FINNHUB_KEY = "d49pi19r01qlaebikhvgd49pi19r01qlaebiki00"
-ROBOFLOW_KEY = "rf_54FHs4sk2XhtAQly4YNOSTjo75B2"
-ROBOFLOW_MODEL_PATH = "chart-pattern-detector/1"  # ggf. anpassen
 
 import streamlit as st
 import json, os, time, random, io, urllib.request, urllib.parse, math
 from datetime import datetime, timedelta
 import statistics
 
-# optional image processing
+# PIL for image heuristics
 try:
-    from PIL import Image, ImageOps, ImageStat
+    from PIL import Image, ImageOps, ImageStat, ImageFilter
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
 
-# ---- App config & style ----
-st.set_page_config(page_title="Lumina Pro — Live + Bild Analyzer", layout="wide", page_icon="💹")
+# -------------------------
+# App config & basic style
+# -------------------------
+st.set_page_config(page_title="Lumina Pro — Daytrading & Image Analyzer", layout="wide", page_icon="💹")
 st.markdown("""
 <style>
-body { background:#000; color:#e6eef6; }
-.stButton>button { background:#111; color:#e6eef6; border:1px solid #222; }
+html, body, [class*="css"] { background:#000 !important; color:#e6eef6 !important; }
+.stButton>button { background:#111 !important; color:#e6eef6 !important; border:1px solid #222 !important; }
 .card { background:#070707; padding:12px; border-radius:8px; border:1px solid #111; margin-bottom:12px; }
 .small { color:#9aa6b2; font-size:13px; }
 .badge { background:#111; color:#e6eef6; padding:6px 10px; border-radius:8px; border:1px solid #222; display:inline-block; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Lumina Pro — Live + Bild Analyzer")
+st.title("Lumina Pro — Daytrading Analyzer (Live) & Offline Image-Structure Analyzer")
 
-# ---- helpers ----
+# -------------------------
+# Utilities
+# -------------------------
 def now_iso(): return datetime.utcnow().isoformat() + "Z"
 
 def internet_ok(timeout=3):
@@ -43,15 +52,14 @@ def internet_ok(timeout=3):
 
 ONLINE = internet_ok()
 
-# ---- file/cache ----
+# cache dir
 CACHE_DIR = ".lumina_cache"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
 def cache_save(key, obj):
     try:
-        path = os.path.join(CACHE_DIR, key + ".json")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(os.path.join(CACHE_DIR, key + ".json"), "w", encoding="utf-8") as f:
             json.dump({"ts": time.time(), "data": obj}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -68,88 +76,16 @@ def cache_load(key, max_age=3600*24):
     except Exception:
         return None
 
-# ---- Roboflow multipart helper ----
-def encode_multipart(file_fieldname, filename, file_bytes, content_type="image/png"):
-    boundary = '----WebKitFormBoundary' + ''.join(random.choice('0123456789abcdef') for _ in range(16))
-    crlf = b'\r\n'
-    body = bytearray()
-    body.extend(b'--' + boundary.encode() + crlf)
-    body.extend(f'Content-Disposition: form-data; name="{file_fieldname}"; filename="{filename}"'.encode() + crlf)
-    body.extend(f'Content-Type: {content_type}'.encode() + crlf + crlf)
-    body.extend(file_bytes + crlf)
-    body.extend(b'--' + boundary.encode() + b'--' + crlf)
-    content_type_header = f'multipart/form-data; boundary={boundary}'
-    return content_type_header, bytes(body)
-
-def roboflow_detect(image_bytes):
-    """
-    Sends image bytes to Roboflow detect endpoint. Returns parsed JSON or None.
-    """
-    if not ROBOFLOW_KEY:
-        return None
-    try:
-        endpoint = f"https://detect.roboflow.com/{ROBOFLOW_MODEL_PATH}?api_key={urllib.parse.quote(ROBOFLOW_KEY)}"
-        content_type, body = encode_multipart("file", "upload.png", image_bytes, "image/png")
-        req = urllib.request.Request(endpoint, data=body, method="POST")
-        req.add_header("Content-Type", content_type)
-        req.add_header("User-Agent", "LuminaPro/1.0")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
-    except Exception:
-        return None
-
-# ---- local image heuristics (PIL) ----
-def analyze_image_local(image_bytes):
-    if not PIL_AVAILABLE:
-        return None
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("L")
-        w,h = img.size
-        # crop focus area (center)
-        cx1, cy1 = int(w*0.05), int(h*0.08)
-        cx2, cy2 = int(w*0.95), int(h*0.75)
-        chart = img.crop((cx1, cy1, cx2, cy2))
-        chart = ImageOps.autocontrast(chart, cutoff=2)
-        pix = chart.load()
-        W,H = chart.size
-        col_sum = [0]*W
-        for x in range(W):
-            s = 0
-            for y in range(H):
-                s += 255 - pix[x,y]
-            col_sum[x] = s
-        # smooth
-        smooth=[]
-        for i in range(W):
-            vals = col_sum[max(0,i-3):min(W,i+4)]
-            smooth.append(sum(vals)/len(vals))
-        avg = sum(smooth)/len(smooth) if smooth else 0
-        peaks=[]; minima=[]
-        for i in range(2, W-2):
-            if smooth[i] > smooth[i-1] and smooth[i] > smooth[i+1] and smooth[i] > avg*1.25:
-                peaks.append(i)
-            if smooth[i] < smooth[i-1] and smooth[i] < smooth[i+1] and smooth[i] < avg*0.75:
-                minima.append(i)
-        left_mean = ImageStat.Stat(chart.crop((0,0,W//2,H))).mean[0]
-        right_mean = ImageStat.Stat(chart.crop((W//2,0,W,H))).mean[0]
-        trend = "Seitwärts"
-        if right_mean > left_mean + 6: trend = "Aufwärtstrend"
-        elif right_mean < left_mean - 6: trend = "Abwärtstrend"
-        notes=[]
-        if peaks: notes.append(f"{len(peaks)} Kerzenleisten erkannt")
-        if minima and len(minima)>=2: notes.append("Möglicher Double Bottom / W-Pattern")
-        if trend != "Seitwärts": notes.append("Heuristik: " + trend)
-        if not notes: notes.append("Keine starke Struktur erkannt")
-        return {"trend": trend, "peaks": len(peaks), "minima": len(minima), "notes": notes}
-    except Exception:
-        return None
-
-# ---- Finnhub fetcher ----
+# -------------------------
+# Finnhub candles fetcher
+# -------------------------
 def fetch_finnhub_candles(symbol: str, resolution: str = "5", from_ts: int = None, to_ts: int = None):
     """
+    Finnhub candle fetcher.
+    symbol: e.g. 'AAPL' or 'BINANCE:BTCUSDT' (depends on Finnhub allowance)
     resolution: '1','5','15','30','60','D'
-    from_ts,to_ts: unix timestamps
+    from_ts,to_ts: unix timestamps (int)
+    returns: list of candles dicts or None
     """
     if not FINNHUB_KEY:
         return None
@@ -157,7 +93,7 @@ def fetch_finnhub_candles(symbol: str, resolution: str = "5", from_ts: int = Non
         if to_ts is None: to_ts = int(time.time())
         if from_ts is None:
             if resolution in ("1","5","15","30","60"):
-                from_ts = to_ts - 60*60*24  # last 24h
+                from_ts = to_ts - 60*60*24  # last 24 hours by default
             else:
                 from_ts = to_ts - 60*60*24*30
         params = {
@@ -197,52 +133,56 @@ def fetch_finnhub_candles(symbol: str, resolution: str = "5", from_ts: int = Non
     except Exception:
         return None
 
-# ---- offline simulator ----
+# -------------------------
+# Offline candle simulator
+# -------------------------
 def generate_simulated_candles(seed: str, periods: int, start_price: float = 100.0, resolution_minutes: int = 5):
     rnd = random.Random(abs(hash(seed)) % (2**31))
     p = float(start_price)
-    prices = []
+    prices=[]
     for _ in range(periods):
         drift = (rnd.random() - 0.49) * 0.003
         shock = (rnd.random() - 0.5) * 0.02
         p = max(0.01, p * (1 + drift + shock))
         prices.append(round(p,6))
-    candles = []
+    candles=[]
     now = datetime.utcnow()
-    for i, price in enumerate(prices):
-        o = round(price * (1 + random.uniform(-0.002, 0.002)), 6)
-        c = price
-        h = round(max(o, c) * (1 + random.uniform(0.0, 0.004)), 6)
-        l = round(min(o, c) * (1 - random.uniform(0.0, 0.004)), 6)
+    for i, prm in enumerate(prices):
+        o = round(prm * (1 + random.uniform(-0.002,0.002)),6)
+        c = prm
+        h = round(max(o,c) * (1 + random.uniform(0.0,0.004)),6)
+        l = round(min(o,c) * (1 - random.uniform(0.0,0.004)),6)
         t = now - timedelta(minutes=(periods - 1 - i) * resolution_minutes)
         candles.append({"t": t, "open": o, "high": h, "low": l, "close": c, "volume": random.randint(1,1000)})
     return candles
 
-# ---- indicators & patterns ----
-def sma(vals, period):
+# -------------------------
+# Indicators & patterns for candles
+# -------------------------
+def sma(values, period):
     res=[]
-    for i in range(len(vals)):
+    for i in range(len(values)):
         if i+1 < period: res.append(None)
-        else: res.append(sum(vals[i+1-period:i+1]) / period)
+        else: res.append(sum(values[i+1-period:i+1])/period)
     return res
 
-def ema(vals, period):
+def ema(values, period):
     res=[]; k = 2.0/(period+1.0); prev=None
-    for v in vals:
+    for v in values:
         if prev is None: prev = v
         else: prev = v * k + prev * (1-k)
         res.append(prev)
     return res
 
-def macd(vals, fast=12, slow=26, signal=9):
-    if not vals: return [],[],[]
-    ef = ema(vals, fast); es = ema(vals, slow)
+def macd(values, fast=12, slow=26, signal=9):
+    if not values: return [],[],[]
+    ef = ema(values, fast); es = ema(values, slow)
     mac = [(a-b) if (a is not None and b is not None) else None for a,b in zip(ef, es)]
     mac_vals = [m for m in mac if m is not None]
     if not mac_vals: return mac, [None]*len(mac), [None]*len(mac)
     sig_vals = ema(mac_vals, signal)
     sig_iter = iter(sig_vals)
-    sig_mapped = []
+    sig_mapped=[]
     for v in mac:
         sig_mapped.append(None if v is None else next(sig_iter))
     hist = [(m-s) if (m is not None and s is not None) else None for m,s in zip(mac, sig_mapped)]
@@ -250,7 +190,7 @@ def macd(vals, fast=12, slow=26, signal=9):
 
 def rsi(values, period=14):
     if len(values) < period+1: return [None]*len(values)
-    deltas = [values[i] - values[i-1] for i in range(1, len(values))]
+    deltas = [values[i] - values[i-1] for i in range(1,len(values))]
     gains = [d if d>0 else 0 for d in deltas]
     losses = [-d if d<0 else 0 for d in deltas]
     avg_gain = sum(gains[:period]) / period
@@ -264,17 +204,20 @@ def rsi(values, period=14):
         res.append(round(val,2))
     return res
 
-# simple candlestick pattern detectors
-def is_doji(c): 
-    body = abs(c["close"] - c["open"]); total = c["high"] - c["low"]
+# candlestick simple detectors
+def is_doji(c):
+    body = abs(c["close"] - c["open"])
+    total = c["high"] - c["low"]
     return total > 0 and (body / total) < 0.15
 
 def is_hammer(c):
-    body = abs(c["close"] - c["open"]); lower = min(c["open"], c["close"]) - c["low"]
+    body = abs(c["close"] - c["open"])
+    lower = min(c["open"], c["close"]) - c["low"]
     return body > 0 and lower > 2 * body
 
 def is_shooting_star(c):
-    body = abs(c["close"] - c["open"]); upper = c["high"] - max(c["open"], c["close"])
+    body = abs(c["close"] - c["open"])
+    upper = c["high"] - max(c["open"], c["close"])
     return body > 0 and upper > 2 * body
 
 def is_bullish_engulfing(prev, cur):
@@ -288,8 +231,8 @@ def is_bearish_engulfing(prev, cur):
 def detect_patterns(candles):
     patterns=[]
     n = len(candles)
-    for i in range(1, n):
-        cur = candles[i]; prev = candles[i-1]
+    for i in range(1,n):
+        cur=candles[i]; prev=candles[i-1]
         if is_bullish_engulfing(prev, cur): patterns.append(("Bullish Engulfing", i))
         if is_bearish_engulfing(prev, cur): patterns.append(("Bearish Engulfing", i))
         if is_hammer(cur): patterns.append(("Hammer", i))
@@ -302,102 +245,182 @@ def detect_patterns(candles):
             patterns.append(("Evening Star", n-1))
     return patterns
 
-# ---- decision logic: combine image + market ----
-def build_recommendation_from_image_and_market(rf_res, heur_res, candles):
-    buy_votes=0; sell_votes=0; avg_conf=0.0; reasons=[]
-    # Roboflow signals
-    if rf_res and isinstance(rf_res, dict):
-        preds = rf_res.get("predictions", [])
-        if preds:
-            avg_conf = sum(p.get("confidence",0) for p in preds)/len(preds)
-        for p in preds:
-            lbl = (p.get("class") or "").lower()
-            if any(k in lbl for k in ["bull","engulf","hammer","morning","threewhite","support"]): buy_votes += 1; reasons.append(f"RF:{p.get('class')}")
-            if any(k in lbl for k in ["bear","shoot","evening","top","resistance"]): sell_votes += 1; reasons.append(f"RF:{p.get('class')}")
-    # local heuristics
-    if heur_res:
-        t = heur_res.get("trend","Seitwärts")
-        if t == "Aufwärtstrend": buy_votes += 1; reasons.append("Heuristik: Aufwärtstrend")
-        if t == "Abwärtstrend": sell_votes += 1; reasons.append("Heuristik: Abwärtstrend")
-        for note in heur_res.get("notes", []): reasons.append("Heuristik: "+note)
-    # patterns from candles
-    patt = detect_patterns(candles) if candles else []
-    for name, idx in patt:
-        ln = name.lower()
-        if any(k in ln for k in ["bull","hammer","morning","three"]): buy_votes += 1; reasons.append("Pattern: "+name)
-        if any(k in ln for k in ["bear","shoot","evening","top"]): sell_votes += 1; reasons.append("Pattern: "+name)
-    # indicators bias
-    closes = [c["close"] for c in candles] if candles else []
-    bias = 0
-    if len(closes) >= 50:
-        s20 = sum(closes[-20:])/20
-        s50 = sum(closes[-50:])/50
-        if s20 > s50: bias += 1; reasons.append("SMA20 > SMA50")
-        else: bias -= 1; reasons.append("SMA20 < SMA50")
-    macd_line, macd_sig, macd_hist = macd(closes) if closes else ([],[],[])
-    if macd_line and macd_sig and macd_line[-1] is not None and macd_sig[-1] is not None:
-        if macd_line[-1] > macd_sig[-1]: bias += 1; reasons.append("MACD > Signal")
-        else: bias -= 1; reasons.append("MACD < Signal")
-    net = buy_votes - sell_votes + bias
-    base_prob = 50.0 + net*7.0 + (avg_conf*12.0 if avg_conf else 0.0)
-    prob = max(5.0, min(95.0, base_prob))
-    # volatility-based risk
-    if len(closes) >= 10:
-        returns = [(closes[i]-closes[i-1])/closes[i-1] for i in range(1,len(closes))]
-        vol = statistics.pstdev(returns) if len(returns) > 1 else 0.02
+# -------------------------
+# Offline image analyzer (structure-only)
+# -------------------------
+def analyze_chart_image_structure(image_bytes):
+    """
+    Offline-only image analyzer: analyses chart structure and returns:
+    - trend: 'Aufwärtstrend'|'Abwärtstrend'|'Seitwärts'
+    - patterns: list of strings (e.g. 'Doji-like','Hammer-like','Engulfing-like')
+    - confidence: 0-100 estimate
+    - volatility_estimate: 0-100
+    - quick_recommendation: 'Kaufen'|'Short'|'Neutral'
+    - summary_sentences: list of short strings (3)
+    This function DOES NOT try to identify the symbol or exact candles count.
+    """
+    if not PIL_AVAILABLE:
+        return {"error":"Pillow not installed; offline image analysis unavailable."}
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")  # grayscale
+    except Exception as e:
+        return {"error":"Image open failed."}
+    # resize for speed
+    W,H = img.size
+    maxw = 1400
+    if W > maxw:
+        img = img.resize((maxw, int(H*maxw/W)))
+        W,H = img.size
+    # crop to likely chart area (exclude header/footer)
+    left = int(W*0.03); right = int(W*0.97)
+    top = int(H*0.08); bottom = int(H*0.78)
+    chart = img.crop((left, top, right, bottom))
+    chart = ImageOps.autocontrast(chart, cutoff=2)
+    chart = chart.filter(ImageFilter.MedianFilter(size=3))
+    pix = chart.load()
+    Wc,Hc = chart.size
+    # compute vertical darkness profile (candles/wicks produce peaks)
+    col_darkness = [0]*Wc
+    for x in range(Wc):
+        s=0
+        for y in range(Hc):
+            s += 255 - pix[x,y]
+        col_darkness[x] = s
+    # smooth profile
+    smooth = []
+    for i in range(Wc):
+        window = col_darkness[max(0,i-4):min(Wc,i+5)]
+        smooth.append(sum(window)/len(window) if window else 0)
+    avg = sum(smooth)/len(smooth) if smooth else 0
+    # detect peaks (candles), troughs
+    peaks=[]; troughs=[]
+    for i in range(2, Wc-2):
+        if smooth[i] > smooth[i-1] and smooth[i] > smooth[i+1] and smooth[i] > avg*1.25:
+            peaks.append(i)
+        if smooth[i] < smooth[i-1] and smooth[i] < smooth[i+1] and smooth[i] < avg*0.6:
+            troughs.append(i)
+    # basic metrics
+    peak_count = len(peaks)
+    trough_count = len(troughs)
+    density = peak_count / (Wc/100.0)  # peaks per 100px
+    # left vs right brightness trend
+    left_mean = ImageStat.Stat(chart.crop((0,0,Wc//2,Hc))).mean[0]
+    right_mean = ImageStat.Stat(chart.crop((Wc//2,0,Wc,Hc))).mean[0]
+    trend = "Seitwärts"
+    if right_mean < left_mean - 6:  # darker right => more candles/wicks => downward bias
+        trend = "Abwärtstrend"
+    elif right_mean > left_mean + 6:
+        trend = "Aufwärtstrend"
+    # detect "doji-like" by scanning narrow vertical lines with low body height
+    # simple heuristic: find narrow dark columns with low vertical variance
+    doji_like = 0
+    hammer_like = 0
+    engulfing_like = 0
+    for idx in peaks[-min(40, len(peaks)):]:
+        col = [255 - pix[idx, y] for y in range(Hc)]
+        # body estimation: high intensity region length
+        thresh = max(1, max(col)*0.4)
+        high_positions = [i for i,v in enumerate(col) if v >= thresh]
+        if not high_positions: continue
+        body_height = max(high_positions) - min(high_positions) if len(high_positions)>1 else 0
+        # if body small relative to height -> doji-like
+        if body_height < Hc*0.06:
+            doji_like += 1
+        # if long lower shadow -> hammer-like: check distance from bottom to body
+        bottom = Hc - 1
+        lower_shadow = bottom - max(high_positions) if high_positions else 0
+        upper_shadow = min(high_positions) - 0 if high_positions else 0
+        if lower_shadow > body_height * 2.5 and body_height > 0:
+            hammer_like += 1
+    # engulfing-like heuristic: look for adjacent peaks with different darkness ratio
+    if len(peaks) >= 2:
+        for i in range(len(peaks)-1):
+            a = peaks[i]; b = peaks[i+1]
+            val_a = smooth[a]; val_b = smooth[b]
+            if val_b > val_a * 1.8:
+                engulfing_like += 1
+    # volatility estimate from variance of smooth
+    variance = statistics.pvariance(smooth) if len(smooth)>1 else 0.0
+    vol_est = min(100.0, max(1.0, variance**0.5 / (avg+1e-9) * 200.0))
+    # build patterns list
+    patterns=[]
+    if doji_like > 0: patterns.append(f"{doji_like}× Doji-like")
+    if hammer_like > 0: patterns.append(f"{hammer_like}× Hammer-like")
+    if engulfing_like > 0: patterns.append(f"{engulfing_like}× Engulfing-like")
+    if peak_count > 12 and density > 6: patterns.append("Hohe Candle-Dichte")
+    if trough_count > 6: patterns.append("Mehrere lokale Tiefs erkannt")
+    if not patterns: patterns.append("Keine klaren Candle-Formen erkannt")
+    # confidence heuristic
+    conf = 30 + min(60, int(min(peak_count, 40) * 1.2 + len(patterns)*4 + (10 if trend != "Seitwärts" else 0)))
+    conf = max(5, min(95, conf))
+    # recommendation logic (structure-only)
+    score = 0
+    if trend == "Aufwärtstrend": score += 2
+    if trend == "Abwärtstrend": score -= 2
+    score += (doji_like * 0)  # neutral-ish
+    score += (hammer_like * 2)
+    score += (engulfing_like * 2)
+    # penalize high volatility for risky
+    risk_pct = min(50.0, max(1.0, vol_est * 0.6))
+    if score >= 3:
+        rec = "Kaufen"
+    elif score <= -2:
+        rec = "Short"
     else:
-        vol = 0.02
-    risk_pct = min(20.0, max(0.5, vol*100*2.5))
-    last = closes[-1] if closes else None
-    if last:
-        stop_loss = round(last * (1 - risk_pct/100.0), 6)
-        take_profit = round(last * (1 + (risk_pct/100.0)*2.0), 6)
+        rec = "Neutral"
+    # estimate success probability
+    prob = min(95.0, max(10.0, 40.0 + score*10 + conf*0.25))
+    # summary sentences
+    summ=[]
+    if rec == "Kaufen":
+        summ.append(f"Strukturanalyse zeigt {', '.join(patterns[:3])}. Trend: {trend}.")
+        summ.append(f"Schätzung Erfolg: {prob:.1f}% • Risiko (Volatilität): {risk_pct:.1f}%.")
+        summ.append("Tipp: Klein einsteigen, Stop-Loss setzen; warte Bestätigung der nächsten Kerze.")
+    elif rec == "Short":
+        summ.append(f"Strukturanalyse liefert bärische Hinweise ({', '.join(patterns[:3])}). Trend: {trend}.")
+        summ.append(f"Schätzung Erfolg: {prob:.1f}% • Risiko: {risk_pct:.1f}%.")
+        summ.append("Tipp: Absichern, Small-Size, Stop oberhalb lokaler Widerstände.")
     else:
-        stop_loss = None; take_profit = None
-    if prob >= 65:
-        rec = "Kaufen (Long empfohlen)"
-    elif prob <= 35:
-        rec = "Short / Verkaufen empfohlen"
-    else:
-        rec = "Neutral / Beobachten"
-    # 3-satz summary
-    summary=[]
-    if rec.startswith("Kaufen"):
-        summary.append(f"Bild & Markt liefern bullishe Hinweise (Score {net:+d}).")
-        summary.append(f"Empfohlener Stop-Loss: ca. {round(risk_pct,2)}% ({stop_loss}).")
-        summary.append("Kleine Position, Stop setzen; bei Bestätigung nachlegen.")
-    elif rec.startswith("Short"):
-        summary.append(f"Mehrere bärische Signale (Score {net:+d}).")
-        summary.append(f"Empfohlener Stop-Loss: ca. {round(risk_pct,2)}% oberhalb des Kurses.")
-        summary.append("Small size oder Absicherung; warte auf Konfirmation.")
-    else:
-        summary.append("Kein klares Signal — Markt neutral.")
-        summary.append("Volumen und weitere Kerzen abwarten.")
-        summary.append("Tipp: Warte auf ein sauberes Setup.")
-    return {"recommendation": rec, "prob": round(prob,1), "risk_pct": round(risk_pct,2),
-            "stop_loss": stop_loss, "take_profit": take_profit, "reasons": reasons, "summary": summary}
+        summ.append(f"Keine eindeutige Struktur — Muster: {', '.join(patterns[:2])}. Trend: {trend}.")
+        summ.append("Warte auf Bestätigung durch weitere Kerzen/Volumen.")
+        summ.append("Tipp: Kein Full-Size Entry ohne Bestätigung.")
+    return {
+        "trend": trend,
+        "patterns": patterns,
+        "confidence": conf,
+        "volatility": round(vol_est,2),
+        "recommendation": rec,
+        "probability": round(prob,1),
+        "risk_pct": round(risk_pct,2),
+        "summary": summ,
+        "internal": {"peak_count": peak_count, "trough_count": trough_count, "density": round(density,2)}
+    }
 
-# ---- SVG renderer for candles ----
+# -------------------------
+# SVG renderer for candles (for Live/Sim charts)
+# -------------------------
 def render_svg_candles(candles, markers=None, stop=None, tp=None, width=1000, height=520):
     if not candles: return "<svg></svg>"
     n = len(candles)
-    margin = 50; chart_h = int(height * 0.64)
-    max_p = max(c["high"] for c in candles); min_p = min(c["low"] for c in candles)
-    pad = (max_p - min_p) * 0.06 if (max_p - min_p) > 0 else 1.0
+    margin = 54
+    chart_h = int(height * 0.62)
+    max_p = max(c["high"] for c in candles)
+    min_p = min(c["low"] for c in candles)
+    pad = (max_p - min_p) * 0.08 if (max_p - min_p) > 0 else 1.0
     max_p += pad; min_p -= pad
     spacing = (width - 2*margin) / n
     candle_w = max(3, spacing * 0.6)
     def y(p): return margin + chart_h - (p - min_p) / (max_p - min_p) * chart_h
     svg = [f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
     svg.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="#07070a"/>')
-    # grid
+    # grid lines and labels
     for i in range(6):
         yy = margin + i*(chart_h/5)
         price_label = round(max_p - i*(max_p-min_p)/5, 6)
         svg.append(f'<line x1="{margin}" y1="{yy}" x2="{width-margin}" y2="{yy}" stroke="#151515" stroke-width="1"/>')
         svg.append(f'<text x="{8}" y="{yy+4}" font-size="11" fill="#9aa6b2">{price_label}</text>')
     # candles
-    for i, c in enumerate(candles):
+    for i,c in enumerate(candles):
         cx = margin + i*spacing + spacing/2
         top = y(c["high"]); low = y(c["low"]); open_y = y(c["open"]); close_y = y(c["close"])
         color = "#00cc66" if c["close"] >= c["open"] else "#ff4d66"
@@ -414,7 +437,7 @@ def render_svg_candles(candles, markers=None, stop=None, tp=None, width=1000, he
                 svg.append(f'<polygon points="{cx-8},{margin+8} {cx+8},{margin+8} {cx},{margin-2}" fill="#00ff88"/>')
             else:
                 svg.append(f'<polygon points="{cx-8},{height-30} {cx+8},{height-30} {cx},{height-46}" fill="#ff7788"/>')
-    # stop and tp lines
+    # stop / tp
     if stop:
         try:
             sy = y(stop)
@@ -429,7 +452,7 @@ def render_svg_candles(candles, markers=None, stop=None, tp=None, width=1000, he
             svg.append(f'<text x="{width-margin-260}" y="{ty-6}" fill="#66ff88" font-size="12">TP: {tp}</text>')
         except Exception:
             pass
-    # x-labels (sparse)
+    # x labels (sparse)
     for i in range(0, n, max(1, n//10)):
         x = margin + i*spacing + spacing/2
         t = ""
@@ -441,195 +464,250 @@ def render_svg_candles(candles, markers=None, stop=None, tp=None, width=1000, he
     svg.append('</svg>')
     return "\n".join(svg)
 
-# ---- UI pages ----
+# -------------------------
+# Decision fusion for image + live
+# -------------------------
+def fuse_image_and_market(image_result, candles):
+    """
+    Combines the offline image structural analysis with market candles (if available)
+    to produce a robust recommendation and parameters (stop, tp, prob, risk).
+    If candles is None, uses only image_result.
+    """
+    # base from image
+    rec = {
+        "recommendation": image_result.get("recommendation", "Neutral"),
+        "prob": image_result.get("probability", 50.0),
+        "risk_pct": image_result.get("risk_pct", 5.0),
+        "stop": None,
+        "tp": None,
+        "reasons": image_result.get("patterns", [])[:6],
+        "summary": image_result.get("summary", [])
+    }
+    last_price = None
+    if candles:
+        last_price = candles[-1]["close"]
+        closes = [c["close"] for c in candles]
+        # adjust prob with simple market indicators
+        s20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else sum(closes)/len(closes)
+        s50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else s20
+        macd_line, macd_sig, _ = macd(closes)
+        bias = 0
+        if s20 > s50: bias += 1
+        else: bias -= 1
+        if macd_line and macd_sig and macd_line[-1] is not None and macd_sig[-1] is not None:
+            if macd_line[-1] > macd_sig[-1]:
+                bias += 1
+            else:
+                bias -= 1
+        rec["prob"] = max(5.0, min(95.0, rec["prob"] + bias * 6.0))
+        # recompute risk using recent volatility
+        if len(closes) >= 10:
+            returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+            vol = statistics.pstdev(returns) if len(returns) > 1 else 0.02
+        else:
+            vol = 0.02
+        rec["risk_pct"] = min(50.0, max(0.5, vol * 100 * 2.5))
+        # stop/tp based on last price
+        rec["stop"] = round(last_price * (1 - rec["risk_pct"]/100.0), 6) if last_price else None
+        rec["tp"] = round(last_price * (1 + (rec["risk_pct"]/100.0) * 2.0), 6) if last_price else None
+        # reasons: add indicator reasons
+        if s20 > s50: rec["reasons"].append("SMA20 > SMA50 (bullish)")
+        else: rec["reasons"].append("SMA20 < SMA50 (bearish)")
+        if macd_line and macd_sig and macd_line[-1] is not None and macd_sig[-1] is not None:
+            if macd_line[-1] > macd_sig[-1]:
+                rec["reasons"].append("MACD > Signal")
+            else:
+                rec["reasons"].append("MACD < Signal")
+    else:
+        # set stop/tp relative to a nominal value if no candles
+        rec["stop"] = None
+        rec["tp"] = None
+    return rec
+
+# -------------------------
+# UI Layout & Pages
+# -------------------------
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Seiten", ["Home", "Live Analyzer", "Bild-Analyse + Live", "Backtest/Train", "Einstellungen", "Hilfe"])
+page = st.sidebar.radio("Seite", ["Home","Live Analyzer","Bild-Analyse (offline)","Portfolio","Einstellungen","Hilfe"])
 
 # quick status
 if not ONLINE:
-    st.sidebar.error("❌ Keine Internetverbindung — Offline-Fallback aktiv")
+    st.sidebar.error("❌ Keine Internetverbindung — Live Daten werden simuliert")
 else:
-    st.sidebar.success("✅ Internet erreichbar")
+    st.sidebar.success("✅ Internet vorhanden (Finnhub live möglich)")
 
-# ---- Home ----
+# Home
 if page == "Home":
     st.header("Übersicht")
-    st.markdown("Willkommen — wähle 'Bild-Analyse + Live' um ein Chartbild hochzuladen und mit Live-Daten zu kombinieren.")
-    st.markdown("- Roboflow model: **" + ROBOFLOW_MODEL_PATH + "**")
-    st.markdown("- Finnhub: **Key gesetzt**" if FINNHUB_KEY else "- Finnhub Key fehlt")
-    if not PIL_AVAILABLE:
-        st.warning("Pillow nicht installiert — lokale Bildheuristik eingeschränkt. Installiere `pillow` in requirements.txt.")
+    st.markdown("""
+    **Lumina Pro** — Daytrading Analyzer mit Offline-Bildanalyse.
+    - Bild-Analyzer: erkennt Strukturen/Muster nur aus dem Bild (offline, keine Symbol-Erkennung).
+    - Live Analyzer: holt Kerzen von Finnhub (falls Internet & Key).
+    """)
+    st.markdown("Schnellaktionen:")
+    col1,col2,col3 = st.columns(3)
+    col1.button("Zur Bild-Analyse", key="goto_img")
+    col2.button("Live Analyzer", key="goto_live")
+    col3.button("Einstellungen", key="goto_set")
+    st.markdown("---")
+    st.write("Tip: Lade klare Chart-Screenshots (Kernausschnitt mit Candles sichtbar) für die beste Bild-Analyse.")
 
-# ---- Bild-Analyse + Live ----
-elif page == "Bild-Analyse + Live":
-    st.header("Bild-Analyse + Live Market Data")
-    st.markdown("Lade ein Chart-Screenshot (TradingView etc.). App kombiniert Roboflow + lokale Heuristik und holt Live Kerzen (Finnhub).")
-    uploaded = st.file_uploader("Chart Bild (PNG/JPG)", type=["png","jpg","jpeg"])
-    col_left, col_right = st.columns([3,1])
-    with col_right:
-        symbol = st.text_input("Finnhub Symbol", value="BINANCE:BTCUSDT")
-        resolution = st.selectbox("Auflösung (min)", ["1","5","15","30","60"], index=1)
-        periods = st.slider("Anzahl Candles", min_value=30, max_value=800, value=240, step=10)
-        fallback_price = st.number_input("Fallback Startpreis", value=20000.0)
-        do_analyze = st.button("Analysiere Bild + Live")
-    with col_left:
-        if uploaded is None:
-            st.info("Bitte ein Chartbild hochladen.")
-        else:
-            st.image(uploaded, use_column_width=True)
-            if do_analyze:
-                image_bytes = uploaded.read()
-                st.info("1) Roboflow Analyse ...")
-                rf = None
-                if ONLINE and ROBOFLOW_KEY:
-                    rf = roboflow_detect(image_bytes)
-                    if rf is None:
-                        st.warning("Roboflow: Keine oder fehlerhafte Antwort. Prüfe MODEL_PATH oder Netzwerk.")
-                    else:
-                        st.success(f"Roboflow: {len(rf.get('predictions', []))} Predictions")
-                else:
-                    st.info("Roboflow übersprungen (kein Internet oder Key).")
-                st.info("2) Lokale Heuristik ...")
-                heur = analyze_image_local(image_bytes) if PIL_AVAILABLE else None
-                if heur:
-                    st.write("Lokale Heuristik:", heur.get("trend"), heur.get("notes"))
-                else:
-                    st.info("Lokale Heuristik nicht verfügbar (Pillow fehlt).")
-                st.info("3) Live Kerzen (Finnhub) abrufen ...")
-                candles = None
-                if ONLINE and FINNHUB_KEY:
-                    to_ts = int(time.time())
-                    from_ts = to_ts - int(periods) * int(resolution) * 60
-                    candles = fetch_finnhub_candles(symbol, resolution, from_ts, to_ts)
-                    if candles is None:
-                        st.warning("Finnhub: Keine Daten erhalten — benutze Simulation.")
-                        candles = generate_simulated_candles(symbol, periods, fallback_price, int(resolution))
-                    else:
-                        if len(candles) < periods:
-                            need = periods - len(candles)
-                            pad = generate_simulated_candles(symbol + "_pad", need, candles[0]["open"] if candles else fallback_price, int(resolution))
-                            candles = pad + candles
-                else:
-                    st.info("Offline oder Finnhub Key fehlt — Simulation wird verwendet.")
-                    candles = generate_simulated_candles(symbol, periods, fallback_price, int(resolution))
-                st.success("Daten gesammelt — kombiniere Analyse ...")
-                rec = build_recommendation_from_image_and_market(rf, heur, candles)
-                # display top line similar to screenshot
-                st.markdown("### Ergebnis")
-                current_price = candles[-1]["close"] if candles else fallback_price
-                cols = st.columns([2,1,1,1])
-                cols[0].markdown(f"**Current Price**\n\n### {current_price:.2f}")
-                # recommendation badge
-                rec_low = rec["recommendation"].lower()
-                if rec_low.startswith("kaufen"):
-                    cols[1].success(rec["recommendation"])
-                elif rec_low.startswith("short"):
-                    cols[1].error(rec["recommendation"])
-                else:
-                    cols[1].info(rec["recommendation"])
-                cols[2].markdown(f"**Stop Loss**\n\n{rec['stop_loss'] if rec['stop_loss'] else 'n/a'}")
-                cols[3].markdown(f"**Take Profit**\n\n{rec['take_profit'] if rec['take_profit'] else 'n/a'}")
-                st.markdown("---")
-                st.markdown(f"**Wahrscheinlichkeit:** {rec['prob']}%  •  **Risiko (Stop Abstand):** {rec['risk_pct']}%")
-                st.markdown("**Gründe / Entdeckte Muster:**")
-                if rec.get("reasons"):
-                    for r in rec["reasons"][:10]:
-                        st.write("- " + r)
-                else:
-                    st.write("- Keine eindeutigen Muster erkannt")
-                st.markdown("**Kurzbeschreibung (3 Sätze):**")
-                for s in rec.get("summary", []): st.write("- " + s)
-                # draw candles
-                svg = render_svg_candles(candles[-160:], markers=None, stop=rec.get("stop_loss"), tp=rec.get("take_profit"), width=1100, height=520)
-                st.components.v1.html(svg, height=560)
-                st.success("Analyse abgeschlossen.")
-
-# ---- Live Analyzer (symbol) ----
+# Live Analyzer page
 elif page == "Live Analyzer":
-    st.header("Live Analyzer (Symbol)")
-    left, right = st.columns([3,1])
+    st.header("Live Analyzer — Symbol (Finnhub)")
+    left,right = st.columns([3,1])
     with right:
         symbol = st.text_input("Finnhub Symbol", value="BINANCE:BTCUSDT")
-        resolution = st.selectbox("Resolution", ["1","5","15","30","60"], index=1)
+        resolution = st.selectbox("Resolution (min)", ["1","5","15","30","60"], index=1)
         periods = st.slider("Candles", 30, 800, 240, step=10)
-        fallback_price = st.number_input("Fallback Price", value=20000.0)
-        do = st.button("Lade & Analysiere Symbol")
+        fallback_price = st.number_input("Fallback Price (if no live)", value=20000.0)
+        run = st.button("Lade & Analysiere Symbol")
     with left:
-        if do:
+        if run:
             candles = None
             if ONLINE and FINNHUB_KEY:
-                to_ts = int(time.time()); from_ts = to_ts - int(periods)*int(resolution)*60
+                to_ts = int(time.time()); from_ts = to_ts - int(periods) * int(resolution) * 60
                 candles = fetch_finnhub_candles(symbol, resolution, from_ts, to_ts)
                 if candles is None:
                     st.warning("Finnhub lieferte keine Daten — Simulation wird verwendet.")
                     candles = generate_simulated_candles(symbol, periods, fallback_price, int(resolution))
                 elif len(candles) < periods:
                     need = periods - len(candles)
-                    pad = generate_simulated_candles(symbol+"_pad", need, candles[0]["open"] if candles else fallback_price, int(resolution))
+                    pad = generate_simulated_candles(symbol + "_pad", need, candles[0]["open"] if candles else fallback_price, int(resolution))
                     candles = pad + candles
             else:
-                st.info("Offline oder Key fehlt — Simulation genutzt.")
+                st.info("Offline or Finnhub key missing — simulation used.")
                 candles = generate_simulated_candles(symbol, periods, fallback_price, int(resolution))
-            # analyze
-            patt = detect_patterns(candles)
+            # analyze candles
             closes = [c["close"] for c in candles]
-            heur = {"trend": "Seitwärts", "notes": []}
-            if len(closes) >= 20:
-                s20 = sum(closes[-20:])/20
-                s50 = sum(closes[-50:])/50 if len(closes)>=50 else s20
-                heur["trend"] = "Aufwärtstrend" if s20 > s50 else "Abwärtstrend" if s20 < s50 else "Seitwärts"
-            rec = build_recommendation_from_image_and_market(None, heur, candles)
-            st.subheader("Ergebnis")
-            st.write(f"Symbol: {symbol}  •  Preis: {candles[-1]['close']:.2f}")
+            s20 = sum(closes[-20:])/20 if len(closes)>=20 else sum(closes)/len(closes)
+            s50 = sum(closes[-50:])/50 if len(closes)>=50 else s20
+            patt = detect_patterns(candles)
+            heur = {"trend": "Aufwärtstrend" if s20 > s50 else "Abwärtstrend" if s20 < s50 else "Seitwärts", "notes": []}
+            rec = fuse_image_and_market({"recommendation":"Neutral","probability":50.0,"risk_pct":5.0,"patterns":[],"summary":[]}, candles)
+            st.subheader(f"{symbol} — Live Analysis")
+            st.markdown(f"**Aktueller Preis:** {candles[-1]['close']:.2f}")
             if rec["recommendation"].lower().startswith("kaufen"): st.success(rec["recommendation"])
             elif rec["recommendation"].lower().startswith("short"): st.error(rec["recommendation"])
             else: st.info(rec["recommendation"])
-            st.write(f"Wahrscheinlichkeit: {rec['prob']}%  •  Risiko: {rec['risk_pct']}%")
-            st.write("Kurzbegründung:")
-            for s in rec["summary"]: st.write("- " + s)
-            svg = render_svg_candles(candles[-160:], markers=None, stop=rec.get("stop_loss"), tp=rec.get("take_profit"))
-            st.components.v1.html(svg, height=560)
+            st.markdown(f"Wahrscheinlichkeit: **{rec['prob']}%**  •  Risiko: **{rec['risk_pct']}%**")
+            st.markdown("**Begründung:**")
+            for r in rec.get("reasons", [])[:8]: st.write("- " + r)
+            st.markdown("**Kurz:**")
+            for s in rec.get("summary", [])[:3]: st.write("- " + s)
+            svg = render_svg_candles(candles[-160:], stop=rec.get("stop"), tp=rec.get("tp"))
+            st.components.v1.html(svg, height=540)
 
-# ---- Backtest / Train ----
-elif page == "Backtest/Train":
-    st.header("Backtest & Perceptron Train (synthetic)")
-    st.markdown("Train simple perceptron on synthetic patterns (fast) to bias predictions.")
-    if st.button("Run Synthetic Backtest & Train"):
-        st.info("Generating synthetic data and training perceptron (this runs locally)...")
-        # simple synthetic training skipped heavy details — placeholder feedback
-        st.success("Training complete (synthetic). Perceptron available in session.")
-        st.balloons()
-    st.markdown("Backtest functionality can be extended — this is a lightweight offline build.")
+# Bild-Analyse (offline-only structure)
+elif page == "Bild-Analyse (offline)":
+    st.header("Bild-Analyse — Struktur & Muster (offline)")
+    st.markdown("Lade ein Chart-Screenshot hoch (nur Strukturanalyse — kein Symbol, keine Candle-Anzahl nötig). Die Analyse läuft **offline** (Pillow).")
+    uploaded = st.file_uploader("Chart-Bild hochladen (PNG/JPG)", type=["png","jpg","jpeg"])
+    col1,col2 = st.columns([3,1])
+    with col2:
+        show_internal = st.checkbox("Zeige interne Metriken (Peak counts)", value=False)
+        analyze_btn = st.button("Analysiere Bild (offline)")
+    with col1:
+        if uploaded is None:
+            st.info("Bitte lade ein Chartbild hoch. Tipp: nur Kerzenbereich, klares Bild.")
+        else:
+            st.image(uploaded, use_column_width=True)
+            if analyze_btn:
+                bytes_img = uploaded.read()
+                if not PIL_AVAILABLE:
+                    st.error("Pillow nicht installiert — installiere pillow in requirements.txt")
+                else:
+                    with st.spinner("Analysiere Bild offline..."):
+                        img_res = analyze_chart_image_structure(bytes_img)
+                    if img_res.get("error"):
+                        st.error(img_res["error"])
+                    else:
+                        # top feedback card like screenshot
+                        left2, right2 = st.columns([2,1])
+                        current_est = "--"
+                        left2.markdown(f"### Empfehlung: ")
+                        rec = img_res["recommendation"]
+                        if rec == "Kaufen":
+                            left2.success(f"{rec}  •  {img_res['probability']}%")
+                        elif rec == "Short":
+                            left2.error(f"{rec}  •  {img_res['probability']}%")
+                        else:
+                            left2.info(f"{rec}  •  {img_res['probability']}%")
+                        left2.markdown(f"**Risiko (Volatility est.)**: {img_res['risk_pct']}%")
+                        left2.markdown("**3-Satz Zusammenfassung:**")
+                        for s in img_res["summary"]:
+                            left2.write("- " + s)
+                        right2.markdown("**Details**")
+                        right2.write("Trend: " + img_res["trend"])
+                        right2.write("Confidence: " + str(img_res["confidence"]) + "%")
+                        right2.write("Volatility est.: " + str(img_res["volatility"]) + "%")
+                        right2.write("Patterns: ")
+                        for p in img_res["patterns"][:6]:
+                            right2.write("- " + p)
+                        if show_internal:
+                            st.markdown("**Interne Metriken**")
+                            st.write(img_res.get("internal", {}))
+                        # no market candles here; just present an illustrative (simulated) svg chart based on the structural profile
+                        demo_candles = generate_simulated_candles("img_demo_seed", 160, start_price=100.0, resolution_minutes=5)
+                        svg = render_svg_candles(demo_candles, width=1000, height=420)
+                        st.components.v1.html(svg, height=450)
+                        st.success("Bildanalyse abgeschlossen (offline).")
 
-# ---- Einstellungen ----
+# Portfolio (light) - keep simple offline
+elif page == "Portfolio":
+    st.header("Portfolio (offline)")
+    st.markdown("Einfaches lokales Portfolio (JSON gespeichert).")
+    PORTFILE = "portfolio_lp.json"
+    if not os.path.exists(PORTFILE):
+        with open(PORTFILE, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    with open(PORTFILE, "r", encoding="utf-8") as f:
+        port = json.load(f)
+    st.write("Positionen:", len(port))
+    if port:
+        for i,p in enumerate(port):
+            st.markdown(f"- **{p.get('name')}** • Menge: {p.get('qty')} • Kauf: {p.get('buy_price')}")
+    st.markdown("---")
+    with st.form("addpos"):
+        n = st.text_input("Name")
+        qty = st.number_input("Menge", value=1.0, step=0.1)
+        bp = st.number_input("Kaufpreis", value=100.0, step=0.01)
+        cat = st.selectbox("Kategorie", ["ETF","Aktie","Krypto"])
+        if st.form_submit_button("Hinzufügen"):
+            port.append({"name":n,"qty":qty,"buy_price":bp,"category":cat,"added": now_iso()})
+            with open(PORTFILE, "w", encoding="utf-8") as f:
+                json.dump(port, f, indent=2, ensure_ascii=False)
+            st.success("Position hinzugefügt. Reload Seite zum Aktualisieren.")
+
+# Einstellungen
 elif page == "Einstellungen":
     st.header("Einstellungen")
-    st.write("Keys (setzen direkt im Code derzeit). Für sicherere Nutzung: verschiebe die Keys in Streamlit secrets.")
-    st.write("Roboflow model path:", ROBOFLOW_MODEL_PATH)
-    st.write("Pillow available:", PIL_AVAILABLE)
-    if st.button("Cache löschen"):
+    st.markdown("API Keys sind direkt im Code. Für mehr Sicherheit: verschiebe sie in Streamlit secrets.")
+    st.write("Finnhub Key gesetzt:", bool(FINNHUB_KEY))
+    st.write("Pillow installiert:", PIL_AVAILABLE)
+    if st.button("Cache leeren"):
         for f in os.listdir(CACHE_DIR):
             try: os.remove(os.path.join(CACHE_DIR, f))
             except: pass
-        st.success("Cache gelöscht")
+        st.success("Cache geleert")
 
-# ---- Hilfe ----
+# Hilfe
 elif page == "Hilfe":
-    st.header("Hilfe & Hinweise")
+    st.header("Hilfe")
     st.markdown("""
     **Wichtig**
-    - Finnhub free-tier hat Rate Limits. Nutze Cache um Limits zu schonen.
-    - Roboflow: stelle sicher, dass `ROBOFLOW_MODEL_PATH` zu deinem Deploy passt.
-    - Pillow (optional) verbessert lokale Bildanalysen.
-    - Empfehlungen sind **keine** Anlageberatung — nur Schätzungen.
+    - Bild-Analyzer arbeitet **offline** und nutzt nur das Bild (keine Symbol-Erkennung).
+    - Live Analyzer braucht Finnhub Key (im Code). Finnhub Free Tier hat Rate Limits.
+    - Installiere `pillow` in requirements.txt für beste Bildfunktionalität.
+    - Empfehlungen sind probabilistische Schätzungen — **keine Anlageberatung**.
     """)
-    st.markdown("Empfohlene Schritte:")
-    st.write("- Teste zuerst offline mit Simulation (kein Key)")
-    st.write("- Lade ein klares Chartbild (Kerzenbereich sichtbar)")
-    st.write("- Passe ROBOFLOW_MODEL_PATH an dein Modell an, wenn nötig")
+    st.markdown("Tipps zur Bildaufnahme:")
+    st.write("- Croppe das Chart so, dass nur Kerzenbereich sichtbar ist (ohne UI-Header).")
+    st.write("- Hohe Auflösung hilft der Struktur-Erkennung.")
+    st.write("- Vermeide Overlay-Annotations (zu viele Linien) — reduziert Erkennungsqualität.")
 
 # footer
 st.markdown("---")
-st.caption("Lumina Pro — Live + Bild Analyzer — built for testing. Keys are embedded per user request. Recommendations are probabilistic estimates and not financial advice.")
+st.caption("Lumina Pro — Offline Image Analyzer + Finnhub Live Analyzer. Empfehlungen sind Schätzungen und keine Finanzberatung.")
 
-# end of file
+# End of file

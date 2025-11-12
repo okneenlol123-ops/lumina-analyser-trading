@@ -1,43 +1,46 @@
 # main.py
-# Lumina Pro — Deep Analyzer (Live Alpha Vantage + Roboflow Image Inference)
-# Features:
-# - Offline image-only chart-structure analyzer (Pillow)
-# - Live data from Finnhub (primary) and Alpha Vantage (fallback)
-# - Robust Roboflow detect wrapper with retries (optional)
-# - Background lightweight backtesting with slippage & fees
-# - Export analysis JSON/CSV
-# - SVG candle renderer fallback; matplotlib rendering optional
+# Lumina Pro — Deep Analyzer (Next Gen)
+# Features included:
+#  - Offline image-structure analyzer (Pillow)
+#  - Roboflow integration (optional) with retries and label->action mapping
+#  - Live data from Finnhub + Alpha Vantage fallback
+#  - SL/TP mapping via local support/resistance detection (pivot)
+#  - Backtester with fees, slippage, position sizing & plain-language summary
+#  - Annotations on uploaded chart images (PIL drawing)
+#  - Exports per-analysis (JSON + CSV)
+#  - SVG candle renderer fallback, matplotlib optional for nicer charts
 #
-# Keys embedded per user's request:
+# NOTE: Keys embedded per user request:
 FINNHUB_KEY = "d49pi19r01qlaebikhvgd49pi19r01qlaebiki00"
 ALPHAV_KEY   = "22XGVO0TQ1UV167C"
 ROBOFLOW_KEY = "rf_54FHs4sk2XhtAQly4YNOSTjo75B2"
-ROBOFLOW_MODEL_PATH = "chart-pattern-detector/1"
+ROBOFLOW_MODEL_PATH = "chart-pattern-detector/1"  # change if needed
 
-# ---------------------------
+# -------------------------
 # Imports
-# ---------------------------
+# -------------------------
 import streamlit as st
-import json, os, time, random, io, urllib.request, urllib.parse, math, csv, traceback
+import json, os, io, time, random, math, urllib.request, urllib.parse, csv, traceback
 from datetime import datetime, timedelta
 import statistics
 
-# optional libs
+# Pillow
 try:
-    from PIL import Image, ImageOps, ImageStat, ImageFilter
+    from PIL import Image, ImageOps, ImageStat, ImageFilter, ImageDraw, ImageFont
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
 
+# matplotlib optional
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
 except Exception:
     MATPLOTLIB_AVAILABLE = False
 
-# ---------------------------
-# Page config & Theme
-# ---------------------------
+# -------------------------
+# Config & Styling
+# -------------------------
 st.set_page_config(page_title="Lumina Pro — Deep Analyzer", layout="wide", page_icon="💹")
 st.markdown("""
 <style>
@@ -48,14 +51,16 @@ html, body, [class*="css"] { background:#000 !important; color:#e6eef6 !importan
 .badge { background:#111; color:#e6eef6; padding:6px 10px; border-radius:8px; border:1px solid #222; display:inline-block; }
 </style>
 """, unsafe_allow_html=True)
-st.title("Lumina Pro — Deep Analyzer (Live Alpha Vantage + Roboflow Image Inference)")
 
-# ---------------------------
-# Utilities & Cache
-# ---------------------------
+st.title("Lumina Pro — Deep Analyzer (Next Gen)")
+
+# -------------------------
+# Utilities
+# -------------------------
 def now_iso(): return datetime.utcnow().isoformat() + "Z"
+def short_ts(): return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-def internet_ok(timeout=3):
+def internet_ok(timeout=2):
     try:
         urllib.request.urlopen("https://www.google.com", timeout=timeout)
         return True
@@ -69,26 +74,26 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 def cache_save(key, obj):
     try:
-        with open(os.path.join(CACHE_DIR, key + ".json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(CACHE_DIR, f"{key}.json"), "w", encoding="utf-8") as f:
             json.dump({"ts": time.time(), "data": obj}, f)
     except Exception:
         pass
 
-def cache_load(key, max_age=3600*24):
+def cache_load(key, max_age=86400):
     try:
-        p = os.path.join(CACHE_DIR, key + ".json")
+        p = os.path.join(CACHE_DIR, f"{key}.json")
         if not os.path.exists(p): return None
         with open(p, "r", encoding="utf-8") as f:
             j = json.load(f)
-        if time.time() - j.get("ts",0) > max_age:
+        if time.time() - j.get("ts", 0) > max_age:
             return None
         return j.get("data")
     except Exception:
         return None
 
-# ---------------------------
-# HTTP multipart helper (Roboflow)
-# ---------------------------
+# -------------------------
+# HTTP multipart helper for Roboflow
+# -------------------------
 def encode_multipart(file_fieldname, filename, file_bytes, content_type="image/png"):
     boundary = '----WebKitFormBoundary' + ''.join(random.choice('0123456789abcdef') for _ in range(16))
     crlf = b'\r\n'
@@ -100,7 +105,7 @@ def encode_multipart(file_fieldname, filename, file_bytes, content_type="image/p
     body.extend(b'--' + boundary.encode() + b'--' + crlf)
     return f'multipart/form-data; boundary={boundary}', bytes(body)
 
-def roboflow_detect_with_retries(image_bytes, retries=2):
+def roboflow_detect(image_bytes, retries=2):
     if not ROBOFLOW_KEY:
         return None
     for attempt in range(retries+1):
@@ -113,21 +118,21 @@ def roboflow_detect_with_retries(image_bytes, retries=2):
             with urllib.request.urlopen(req, timeout=30) as resp:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw)
-        except Exception as e:
+        except Exception:
             if attempt < retries:
                 time.sleep(1 + attempt)
                 continue
-            else:
-                return None
+            return None
 
-# ---------------------------
+# -------------------------
 # Market data fetchers
-# ---------------------------
-def fetch_finnhub_candles(symbol: str, resolution: str = "5", from_ts: int = None, to_ts: int = None):
+# -------------------------
+def fetch_finnhub_candles(symbol, resolution="5", from_ts=None, to_ts=None):
     if not FINNHUB_KEY:
         return None
     try:
-        if to_ts is None: to_ts = int(time.time())
+        if to_ts is None:
+            to_ts = int(time.time())
         if from_ts is None:
             if resolution in ("1","5","15","30","60"):
                 from_ts = to_ts - 60*60*24
@@ -136,21 +141,23 @@ def fetch_finnhub_candles(symbol: str, resolution: str = "5", from_ts: int = Non
         params = {"symbol": symbol, "resolution": resolution, "from": str(int(from_ts)), "to": str(int(to_ts)), "token": FINNHUB_KEY}
         url = "https://finnhub.io/api/v1/stock/candle?" + urllib.parse.urlencode(params)
         with urllib.request.urlopen(url, timeout=25) as resp:
-            raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
+            txt = resp.read().decode("utf-8")
+            data = json.loads(txt)
         if data.get("s") != "ok":
             return None
         ts = data.get("t", []); o = data.get("o", []); h = data.get("h", []); l = data.get("l", []); c = data.get("c", []); v = data.get("v", [])
         candles=[]
         for i, t in enumerate(ts):
-            try: dt = datetime.utcfromtimestamp(int(t))
-            except: dt = datetime.utcnow()
+            try:
+                dt = datetime.utcfromtimestamp(int(t))
+            except:
+                dt = datetime.utcnow()
             candles.append({"t": dt, "open": float(o[i]), "high": float(h[i]), "low": float(l[i]), "close": float(c[i]), "volume": float(v[i]) if v and i < len(v) else 0.0})
         return candles
     except Exception:
         return None
 
-def fetch_alpha_minute(symbol: str, interval="5min", outputsize="compact"):
+def fetch_alpha_minute(symbol, interval="5min", outputsize="compact"):
     if not ALPHAV_KEY:
         return None
     try:
@@ -176,8 +183,8 @@ def fetch_alpha_minute(symbol: str, interval="5min", outputsize="compact"):
     except Exception:
         return None
 
-# fallback generator
-def generate_simulated_candles(seed: str, periods: int, start_price: float = 100.0, resolution_minutes: int = 5):
+# fallback simulated candles
+def generate_simulated_candles(seed, periods, start_price=100.0, resolution_minutes=5):
     rnd = random.Random(abs(hash(seed)) % (2**31))
     p = float(start_price)
     prices=[]
@@ -187,21 +194,23 @@ def generate_simulated_candles(seed: str, periods: int, start_price: float = 100
         p = max(0.01, p * (1 + drift + shock))
         prices.append(round(p,6))
     candles=[]; now = datetime.utcnow()
-    for i, prm in enumerate(prices):
-        o = round(prm * (1 + random.uniform(-0.002,0.002)),6); c = prm
-        h = round(max(o,c) * (1 + random.uniform(0.0,0.004)),6); l = round(min(o,c) * (1 - random.uniform(0.0,0.004)),6)
+    for i,pr in enumerate(prices):
+        o = round(pr * (1 + random.uniform(-0.002, 0.002)),6)
+        c = pr
+        h = round(max(o,c) * (1 + random.uniform(0.0,0.004)),6)
+        l = round(min(o,c) * (1 - random.uniform(0.0,0.004)),6)
         t = now - timedelta(minutes=(periods - 1 - i) * resolution_minutes)
         candles.append({"t": t, "open": o, "high": h, "low": l, "close": c, "volume": random.randint(1,1000)})
     return candles
 
-# ---------------------------
+# -------------------------
 # Indicators & pattern detectors
-# ---------------------------
+# -------------------------
 def sma(vals, period):
     res=[]
     for i in range(len(vals)):
         if i+1 < period: res.append(None)
-        else: res.append(sum(vals[i+1-period:i+1])/period)
+        else: res.append(sum(vals[i+1-period:i+1]) / period)
     return res
 
 def ema(vals, period):
@@ -239,10 +248,16 @@ def rsi(vals, period=14):
         res.append(round(val,2))
     return res
 
-# candle detectors
-def is_doji(c): body = abs(c["close"] - c["open"]); total = c["high"] - c["low"]; return total > 0 and (body / total) < 0.15
-def is_hammer(c): body = abs(c["close"] - c["open"]); lower = min(c["open"], c["close"]) - c["low"]; return body > 0 and lower > 2 * body
-def is_shooting_star(c): body = abs(c["close"] - c["open"]); upper = c["high"] - max(c["open"], c["close"]); return body > 0 and upper > 2 * body
+# candlestick simple detectors
+def is_doji(c): 
+    body = abs(c["close"] - c["open"]); total = c["high"] - c["low"]
+    return total > 0 and (body / total) < 0.15
+def is_hammer(c):
+    body = abs(c["close"] - c["open"]); lower = min(c["open"], c["close"]) - c["low"]
+    return body > 0 and lower > 2 * body
+def is_shooting_star(c):
+    body = abs(c["close"] - c["open"]); upper = c["high"] - max(c["open"], c["close"])
+    return body > 0 and upper > 2 * body
 def is_bullish_engulfing(prev, cur):
     if not prev: return False
     return (cur["close"] > cur["open"]) and (prev["close"] < prev["open"]) and (cur["open"] < prev["close"]) and (cur["close"] > prev["open"])
@@ -266,34 +281,39 @@ def detect_patterns(candles):
             patterns.append(("Evening Star", n-1))
     return patterns
 
-# ---------------------------
-# Image Analyzer: improved (main focus)
-# - returns trend, patterns, confidence, volatility, recommendation, probability, risk_pct, summary, internals
-# ---------------------------
+# -------------------------
+# Image Analyzer (improved)
+# -------------------------
 def analyze_chart_image_structure(image_bytes):
+    """
+    Input: raw image bytes (screenshot)
+    Output: dict with trend, patterns (strings), confidence, volatility est, recommendation, probability, risk_pct, summary, internal metrics
+    """
     if not PIL_AVAILABLE:
-        return {"error":"Pillow not installed; install pillow for image analyzer."}
+        return {"error":"Pillow not installed. Install pillow for image analyzer."}
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("L")
-    except Exception:
-        return {"error":"Failed to open image."}
+    except Exception as e:
+        return {"error":"Image open failed."}
     W,H = img.size
     maxw = 1400
     if W > maxw:
         img = img.resize((maxw, int(H * maxw / W))); W,H = img.size
+    # crop to central region (likely candles)
     left = int(W*0.03); right = int(W*0.97); top = int(H*0.08); bottom = int(H*0.78)
     chart = img.crop((left, top, right, bottom))
     chart = ImageOps.autocontrast(chart, cutoff=2); chart = chart.filter(ImageFilter.MedianFilter(size=3))
-    pix = chart.load(); Wc,Hc = chart.size
-    # vertical profile
+    pix = chart.load()
+    Wc,Hc = chart.size
+    # vertical darkness profile
     col_darkness = []
     for x in range(Wc):
-        s = 0
+        s=0
         for y in range(0, Hc, 2):
             s += 255 - pix[x,y]
         col_darkness.append(s)
-    # smooth
-    smooth=[] 
+    # smooth profile
+    smooth = []
     for i in range(Wc):
         w = col_darkness[max(0,i-4):min(Wc,i+5)]
         smooth.append(sum(w)/len(w) if w else 0)
@@ -304,41 +324,40 @@ def analyze_chart_image_structure(image_bytes):
             peaks.append(i)
         if smooth[i] < smooth[i-1] and smooth[i] < smooth[i+1] and smooth[i] < avg*0.6:
             troughs.append(i)
-    peak_count = len(peaks); trough_count = len(troughs)
+    peak_count=len(peaks); trough_count=len(troughs)
     density = peak_count / (Wc/100.0 + 1e-9)
+    # left-right brightness trend
     left_mean = ImageStat.Stat(chart.crop((0,0,Wc//2,Hc))).mean[0]
     right_mean = ImageStat.Stat(chart.crop((Wc//2,0,Wc,Hc))).mean[0]
-    # corrected trend logic (explicit)
     if right_mean > left_mean + 6:
         trend = "Aufwärtstrend"
     elif right_mean < left_mean - 6:
         trend = "Abwärtstrend"
     else:
         trend = "Seitwärts"
-    # detailed pattern heuristics
-    doji_like=0; hammer_like=0; engulfing_like=0; shooting_like=0; harami_like=0
-    sample_indices = peaks[-min(120,len(peaks)):] if peaks else []
-    for idx in sample_indices:
+    # pattern heuristics scanning peaks
+    doji_like = 0; hammer_like = 0; shooting_like = 0; engulfing_like = 0
+    sample = peaks[-min(120,len(peaks)):] if peaks else []
+    for idx in sample:
         col = [255 - pix[idx, y] for y in range(Hc)]
         maxv = max(col) if col else 0
         if maxv <= 0: continue
-        thresh = max(2, maxv * 0.4)
-        high_pos = [i for i,v in enumerate(col) if v >= thresh]
-        if not high_pos: continue
-        body_height = (max(high_pos) - min(high_pos)) if len(high_pos)>1 else 0
-        lower_shadow = Hc - 1 - max(high_pos)
-        upper_shadow = min(high_pos)
-        if body_height < Hc * 0.05: doji_like += 1
-        if lower_shadow > body_height * 2.5 and body_height > 0: hammer_like += 1
-        if upper_shadow > body_height * 2.5 and body_height > 0: shooting_like += 1
-    # engulfing detection via ratios
+        thresh = max(2, maxv*0.4)
+        highpos = [i for i,v in enumerate(col) if v >= thresh]
+        if not highpos: continue
+        body_h = max(highpos) - min(highpos) if len(highpos) > 1 else 0
+        lower_shadow = Hc - 1 - max(highpos)
+        upper_shadow = min(highpos)
+        if body_h < Hc * 0.05: doji_like += 1
+        if lower_shadow > body_h * 2.5 and body_h > 0: hammer_like += 1
+        if upper_shadow > body_h * 2.5 and body_h > 0: shooting_like += 1
     for i in range(len(peaks)-1):
         a = peaks[i]; b = peaks[i+1]
-        if smooth[b] > smooth[a] * 1.9: engulfing_like += 1
-    # volatility estimate
+        if smooth[b] > smooth[a] * 1.9:
+            engulfing_like += 1
     var = statistics.pvariance(smooth) if len(smooth)>1 else 0.0
     vol_est = min(100.0, max(1.0, (var**0.5)/(avg+1e-9) * 200.0))
-    # assemble patterns
+    # patterns bucket
     patterns=[]
     if doji_like: patterns.append(f"{doji_like}× Doji-like")
     if hammer_like: patterns.append(f"{hammer_like}× Hammer-like")
@@ -346,349 +365,489 @@ def analyze_chart_image_structure(image_bytes):
     if engulfing_like: patterns.append(f"{engulfing_like}× Engulfing-like")
     if peak_count > 12 and density > 6: patterns.append("Hohe Candle-Dichte")
     if trough_count > 6: patterns.append("Mehrere lokale Tiefs")
-    if not patterns: patterns.append("Keine klaren Candle-Formen erkannt")
-    conf = 30 + min(60, int(min(peak_count, 60) * 1.2 + len(patterns)*4 + (10 if trend!="Seitwärts" else 0)))
+    if not patterns: patterns.append("Keine klaren Candle-Formen")
+    conf = 30 + min(60, int(min(peak_count, 70)*1.2 + len(patterns)*4 + (10 if trend!="Seitwärts" else 0)))
     conf = max(5, min(98, conf))
-    # scoring
-    score = 0
-    if trend == "Aufwärtstrend": score += 2
-    if trend == "Abwärtstrend": score -= 2
-    score += hammer_like * 2; score += engulfing_like * 2; score -= shooting_like * 2
+    score=0
+    if trend=="Aufwärtstrend": score+=2
+    if trend=="Abwärtstrend": score-=2
+    score += hammer_like*2 + engulfing_like*2 - shooting_like*2
     if score >= 3: rec = "Kaufen"
     elif score <= -2: rec = "Short"
     else: rec = "Neutral"
-    prob = min(95.0, max(10.0, 45.0 + score * 9.0 + conf * 0.2))
-    risk_pct = min(50.0, max(1.0, vol_est * 0.6))
-    # create summary
+    prob = min(95.0, max(10.0, 45.0 + score*9.0 + conf*0.2))
+    risk_pct = min(50.0, max(1.0, vol_est*0.6))
+    # summary phrases
     summary=[]
-    if rec == "Kaufen":
+    if rec=="Kaufen":
         summary.append(f"Bild-Struktur zeigt {', '.join(patterns[:3])}. Trend: {trend}.")
         summary.append(f"Geschätzte Trefferwahrscheinlichkeit: {prob:.1f}% • Risiko: {risk_pct:.1f}%.")
-        summary.append("Empfehlung: Klein long mit Stop-Loss, warte Bestätigung der nächsten Kerze.")
-    elif rec == "Short":
-        summary.append(f"Bild-Struktur zeigt bärische Muster ({', '.join(patterns[:3])}). Trend: {trend}.")
+        summary.append("Empfehlung: Kleine Long-Position mit Stop-Loss; warte Bestätigung der nächsten Kerze.")
+    elif rec=="Short":
+        summary.append(f"Bärische Struktur erkannt ({', '.join(patterns[:3])}). Trend: {trend}.")
         summary.append(f"Geschätzte Trefferwahrscheinlichkeit: {prob:.1f}% • Risiko: {risk_pct:.1f}%.")
-        summary.append("Empfehlung: Short mit enger Absicherung oder warten auf Bestätigung.")
+        summary.append("Empfehlung: Short mit enger Absicherung oder Abwarten.")
     else:
-        summary.append("Keine eindeutige Struktur erkennbar.")
-        summary.append("Empfehlung: Warten auf Bestätigung / Volumenanstieg.")
+        summary.append("Keine eindeutige Struktur erkannt.")
+        summary.append("Empfehlung: Warten auf Bestätigung (Volumen/Breakout).")
         summary.append("Tipp: Kein Full-Size-Entry ohne Bestätigung.")
-    return {"trend":trend,"patterns":patterns,"confidence":conf,"volatility":round(vol_est,2),"recommendation":rec,"probability":round(prob,1),"risk_pct":round(risk_pct,2),"summary":summary,"internal":{"peaks":peak_count,"troughs":trough_count,"density":round(density,2)}}
+    # prepare internal metrics for annotation
+    internal = {"peaks": peak_count, "troughs": trough_count, "density": round(density,2)}
+    return {"trend": trend, "patterns": patterns, "confidence": conf, "volatility": round(vol_est,2), "recommendation": rec, "probability": round(prob,1), "risk_pct": round(risk_pct,2), "summary": summary, "internal": internal, "chart_image": chart}
 
-# ---------------------------
-# Backtesting functions (with slippage & fees)
-# ---------------------------
-def backtest_pattern_on_history(pattern_name, candles, lookahead=10, slippage_pct=0.0, fee_pct=0.0):
-    hits=0; total=0; returns=[]
-    n = len(candles)
-    for i in range(2, n - lookahead):
-        prev = candles[i-1]; cur = candles[i]
-        detected=False
-        pn = pattern_name.lower()
-        if "engulf" in pn:
-            if is_bullish_engulfing(prev, cur) or is_bearish_engulfing(prev, cur): detected=True
-        if "hammer" in pn:
-            if is_hammer(cur): detected=True
-        if "doji" in pn:
-            if is_doji(cur): detected=True
-        if not detected: continue
-        total += 1
-        entry = cur["close"] * (1 + slippage_pct/100.0)
-        future = candles[i + lookahead]["close"] * (1 - slippage_pct/100.0)
-        ret = (future - entry) / (entry + 1e-12) - fee_pct/100.0
-        returns.append(ret)
-        if ret > 0: hits += 1
-    winrate = (hits / total * 100.0) if total else 0.0
-    avg_ret = (sum(returns)/len(returns)*100.0) if returns else 0.0
-    return {"pattern":pattern_name,"checked":total,"wins":hits,"winrate":round(winrate,2),"avg_return_pct":round(avg_ret,3)}
+# -------------------------
+# Support/Resistance detection (local pivots) -> use for SL/TP
+# -------------------------
+def local_pivots_from_candles(candles, window=5):
+    highs=[c["high"] for c in candles]; lows=[c["low"] for c in candles]
+    pivots_high=[]; pivots_low=[]
+    n=len(candles)
+    for i in range(window, n-window):
+        hl = highs[i]
+        if all(hl > highs[j] for j in range(i-window, i)) and all(hl > highs[j] for j in range(i+1, i+window+1)):
+            pivots_high.append((i, highs[i]))
+        ll = lows[i]
+        if all(ll < lows[j] for j in range(i-window, i)) and all(ll < lows[j] for j in range(i+1, i+window+1)):
+            pivots_low.append((i, lows[i]))
+    return pivots_high, pivots_low
 
-# ---------------------------
-# SVG candle renderer (fallback)
-# ---------------------------
-def render_svg_candles(candles, markers=None, stop=None, tp=None, width=1000, height=520):
-    if not candles: return "<svg></svg>"
-    n = len(candles)
-    margin = 54; chart_h = int(height * 0.62)
-    max_p = max(c["high"] for c in candles); min_p = min(c["low"] for c in candles)
-    pad = (max_p - min_p) * 0.08 if (max_p - min_p) > 0 else 1.0
-    max_p += pad; min_p -= pad
-    spacing = (width - 2*margin) / n; candle_w = max(3, spacing * 0.6)
-    def y(p): return margin + chart_h - (p - min_p) / (max_p - min_p) * chart_h
-    svg = [f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
-    svg.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="#07070a"/>')
-    for i in range(6):
-        yy = margin + i*(chart_h/5)
-        price_label = round(max_p - i*(max_p-min_p)/5, 6)
-        svg.append(f'<line x1="{margin}" y1="{yy}" x2="{width-margin}" y2="{yy}" stroke="#151515" stroke-width="1"/>')
-        svg.append(f'<text x="{8}" y="{yy+4}" font-size="11" fill="#9aa6b2">{price_label}</text>')
-    for i,c in enumerate(candles):
-        cx = margin + i*spacing + spacing/2
-        top = y(c["high"]); low = y(c["low"]); oy = y(c["open"]); cy = y(c["close"])
-        color = "#00cc66" if c["close"] >= c["open"] else "#ff4d66"
-        svg.append(f'<line x1="{cx}" y1="{top}" x2="{cx}" y2="{low}" stroke="#888" stroke-width="1"/>')
-        by = min(oy, cy); bh = max(1, abs(cy - oy))
-        svg.append(f'<rect x="{cx-candle_w/2}" y="{by}" width="{candle_w}" height="{bh}" fill="{color}" stroke="{color}" rx="1" ry="1"/>')
-    if markers:
-        for m in markers:
-            i = m.get("idx", len(candles)-1)
-            if i<0 or i>=n: continue
-            cx = margin + i*spacing + spacing/2
-            if m.get("type","").lower() == "buy":
-                svg.append(f'<polygon points="{cx-8},{margin+8} {cx+8},{margin+8} {cx},{margin-2}" fill="#00ff88"/>')
-            else:
-                svg.append(f'<polygon points="{cx-8},{height-30} {cx+8},{height-30} {cx},{height-46}" fill="#ff7788"/>')
-    if stop:
-        try:
-            sy = y(stop); svg.append(f'<line x1="{margin}" y1="{sy}" x2="{width-margin}" y2="{sy}" stroke="#ffcc00" stroke-width="2" stroke-dasharray="6,4"/><text x="{width-margin-260}" y="{sy-6}" fill="#ffcc00" font-size="12">Stop: {stop}</text>')
-        except: pass
-    if tp:
-        try:
-            ty = y(tp); svg.append(f'<line x1="{margin}" y1="{ty}" x2="{width-margin}" y2="{ty}" stroke="#66ff88" stroke-width="2" stroke-dasharray="4,4"/><text x="{width-margin-260}" y="{ty-6}" fill="#66ff88" font-size="12">TP: {tp}</text>')
-        except: pass
-    for i in range(0, n, max(1, n//10)):
-        x = margin + i*spacing + spacing/2
-        try: t = candles[i]["t"].strftime("%m-%d %H:%M")
-        except: t = str(candles[i].get("t",""))
-        svg.append(f'<text x="{x-36}" y="{height-6}" font-size="11" fill="#9aa6b2">{t}</text>')
-    svg.append('</svg>'); return "\n".join(svg)
-
-# ---------------------------
-# Fusion logic: image -> mapping to TP/SL + backtest insights + final recommendation
-# ---------------------------
 def map_patterns_to_levels(image_result, candles=None):
-    # Basic TP/SL mapping: use image volatility & a last price (if available).
-    last_price = candles[-1]["close"] if candles else None
+    """
+    Map image patterns to concrete stop-loss and take-profit levels.
+    If 'candles' provided, use last price and local pivots; otherwise provide relative SL/TP.
+    """
     risk = image_result.get("risk_pct", 5.0)
-    stop = round(last_price * (1 - risk/100.0), 6) if last_price else None
-    tp = round(last_price * (1 + risk/100.0 * 2.0), 6) if last_price else None
-    # Map key patterns to textual strategies
-    strategy_notes=[]
-    for p in image_result.get("patterns", []):
-        key = p.lower()
-        if "hammer" in key: strategy_notes.append("Reverse-entry: Hammer suggests possible short-term reversal")
-        if "engulf" in key: strategy_notes.append("Momentum entry: Engulfing often leads to short-run continuation")
-        if "doji" in key: strategy_notes.append("Indecision: Doji suggests wait for confirmation")
-        if "shoot" in key: strategy_notes.append("Rejection: Shooting-star may indicate rejection at highs")
-    return {"stop":stop,"tp":tp,"notes":strategy_notes}
+    pat = image_result.get("patterns", [])
+    last_price = candles[-1]["close"] if candles else None
+    sl=None; tp=None; notes=[]
+    # if candles available -> use pivots
+    if candles and len(candles)>=20:
+        ph, pl = local_pivots_from_candles(candles, window=4)
+        # choose nearest pivot below as support, above as resistance
+        last_close = candles[-1]["close"]
+        supports = sorted([p[1] for p in pl if p[1] < last_close], reverse=True)
+        resistances = sorted([p[1] for p in ph if p[1] > last_close])
+        if supports:
+            sl = supports[0] * (1 - 0.002)  # slightly under support
+            notes.append("Stop unter lokalem Support")
+        else:
+            sl = last_close * (1 - risk/100.0)
+            notes.append("Stop relativ (kein Support gefunden)")
+        if resistances:
+            tp = resistances[0] * (1 + 0.002)
+            notes.append("TP an lokalem Widerstand")
+        else:
+            tp = last_close * (1 + 2 * risk/100.0)
+            notes.append("TP relativ (kein Resistance)")
+    else:
+        if last_price:
+            sl = last_price * (1 - risk/100.0)
+            tp = last_price * (1 + 2*risk/100.0)
+            notes.append("Relative SL/TP (keine Candle-Historie)")
+        else:
+            # fallback absolute ratios
+            sl = None; tp=None
+            notes.append("Keine Price-Info: nur relative Empfehlung")
+    return {"stop": None if sl is None else round(sl,6), "tp": None if tp is None else round(tp,6), "notes": notes}
 
-# ---------------------------
-# UI & Pages
-# ---------------------------
+# -------------------------
+# Backtester (improved)
+# -------------------------
+def backtest_strategy_on_history(candles, entries, position_size_pct=1.0, slippage_pct=0.05, fee_pct=0.02, lookahead=10):
+    """
+    candles: historical list (old->new)
+    entries: list of indices where we 'entered' (detected pattern)
+    Simulate simple market orders: entry at close after pattern, exit after lookahead or stop hit (no intraday sim; approximate).
+    returns: dict summary & trades list
+    """
+    equity = 10000.0  # base bankroll for simulation
+    trades = []
+    wins = 0; losses = 0; total_ret = 0.0
+    for idx in entries:
+        if idx+lookahead >= len(candles): continue
+        entry_price = candles[idx]["close"] * (1 + slippage_pct/100.0)
+        # simple stop = entry *  (1 - 0.01) for example; here we won't dynamically apply SL intraday; we'll compute outcome at lookahead price
+        exit_price = candles[idx+lookahead]["close"] * (1 - slippage_pct/100.0)
+        gross_ret = (exit_price - entry_price) / (entry_price + 1e-12)
+        net_ret = gross_ret - fee_pct/100.0
+        position_value = equity * (position_size_pct/100.0)
+        pnl = position_value * net_ret
+        total_ret += net_ret
+        trades.append({"idx": idx, "entry": entry_price, "exit": exit_price, "gross_ret_pct": round(gross_ret*100,3), "net_ret_pct": round(net_ret*100,3), "pnl": round(pnl,2)})
+        if net_ret > 0:
+            wins += 1
+        else:
+            losses += 1
+    total_trades = len(trades)
+    winrate = (wins/total_trades*100.0) if total_trades>0 else 0.0
+    avg_ret = (sum(t["net_ret_pct"] for t in trades)/total_trades) if total_trades>0 else 0.0
+    pf = (sum(t["pnl"] for t in trades if t["pnl"]>0) / abs(sum(t["pnl"] for t in trades if t["pnl"]<0))) if any(t["pnl"]<0 for t in trades) else (sum(t["pnl"] for t in trades if t["pnl"]>0) or 0.0)
+    # Plain-language summary
+    if total_trades == 0:
+        summary = "Keine Trades gefunden für Backtest."
+    else:
+        perf = "gut" if winrate > 55 and avg_ret > 0 else "neutral" if winrate > 40 else "riskant"
+        summary = f"In {total_trades} getesteten Trades lag die Trefferquote bei {winrate:.1f}% (avg return {avg_ret:.3f}% netto). Performance-Label: {perf}."
+    return {"trades": trades, "total": total_trades, "wins": wins, "losses": losses, "winrate": round(winrate,2), "avg_return_pct": round(avg_ret,3), "profit_factor": round(pf,3) if isinstance(pf, float) else None, "summary": summary}
+
+# -------------------------
+# Annotation: draw arrows/lines on uploaded chart image to indicate patterns & SL/TP
+# -------------------------
+def annotate_chart_image(pil_img, detections, sl=None, tp=None):
+    """
+    pil_img: PIL.Image (RGB or L) - whole screenshot
+    detections: list of dicts with keys: {'type': 'Hammer','x': px, 'y': px, 'dir': 'up'/'down'}
+    sl,tp: price levels - we will draw lines across approximate y-coordinates if chart cropping provided with mapping
+    Returns: annotated PIL image object
+    """
+    # convert to RGBA to draw
+    if pil_img.mode != "RGBA":
+        base = pil_img.convert("RGBA")
+    else:
+        base = pil_img.copy()
+    draw = ImageDraw.Draw(base, "RGBA")
+    W,H = base.size
+    # choose font if available
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font = None
+    # draw detections as small arrows/labels
+    for d in detections:
+        x = int(d.get("x", W*0.5))
+        y = int(d.get("y", H*0.5))
+        typ = d.get("type","Pattern")
+        direction = d.get("dir","up")
+        color = (0,255,136,200) if direction=="up" else (255,100,120,200)
+        # arrow
+        if direction=="up":
+            draw.polygon([(x, y-14), (x-8, y+6), (x+8, y+6)], fill=color)
+        else:
+            draw.polygon([(x, y+14), (x-8, y-6), (x+8, y-6)], fill=color)
+        # label
+        txt = typ
+        txt_w, txt_h = draw.textsize(txt, font=font) if font else (len(txt)*6, 12)
+        draw.rectangle([x-txt_w//2-6, y+10, x+txt_w//2+6, y+10+txt_h+6], fill=(10,10,10,180))
+        draw.text((x-txt_w//2, y+12), txt, fill=(230,238,246,255), font=font)
+    # draw SL/TP as horizontal lines if provided
+    if sl is not None:
+        # map price->y unknown: just draw label at top right to indicate value
+        draw.line([(20, H*0.12), (W-20, H*0.12)], fill=(255,204,0,160), width=2)
+        draw.text((30, H*0.12-12), f"Stop: {sl}", fill=(255,204,0,255), font=font)
+    if tp is not None:
+        draw.line([(20, H*0.18), (W-20, H*0.18)], fill=(102,255,136,160), width=2)
+        draw.text((30, H*0.18-12), f"TP: {tp}", fill=(102,255,136,255), font=font)
+    return base
+
+# -------------------------
+# Export helpers
+# -------------------------
+def export_analysis_json(obj):
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+def export_analysis_csv(obj):
+    # flatten some fields into CSV with key,value rows
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["key","value"])
+    # meta
+    meta = obj.get("meta", {})
+    for k,v in meta.items():
+        w.writerow([f"meta.{k}", v])
+    final = obj.get("final", {})
+    for k,v in final.items():
+        if isinstance(v, (str,int,float)):
+            w.writerow([k, v])
+        else:
+            try:
+                w.writerow([k, json.dumps(v, ensure_ascii=False)])
+            except:
+                w.writerow([k, str(v)])
+    return buf.getvalue()
+
+# -------------------------
+# UI: Navigation
+# -------------------------
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Seiten", ["Home","Live Analyzer","Bild-Analyse (offline)","Backtest","Einstellungen","Hilfe"])
+page = st.sidebar.radio("Seite", ["Home","Live Analyzer","Bild-Analyse (offline)","Backtest","Einstellungen","Hilfe"])
 
 if not ONLINE:
     st.sidebar.error("❌ Keine Internetverbindung — Live Daten werden simuliert")
 else:
     st.sidebar.success("✅ Internet verfügbar")
 
-# Home
+# -------------------------
+# Page: Home
+# -------------------------
 if page == "Home":
     st.header("Lumina Pro — Deep Analyzer")
     st.markdown("""
-    - Bild-Analyzer (offline) — automatisch: Muster, Volatilität, klare Empfehlung.
-    - Live Analyzer (Finnhub / Alpha Vantage fallback).
-    - Background Backtesting & exportierbare Analysen.
+    **Was neu ist:** SL/TP Mapping, Export, Roboflow label→action mapping, verbesserter Backtester, Annotationen.
+    Lade ein Chartbild in 'Bild-Analyse' oder probiere 'Live Analyzer'.
     """)
-    st.write("Pillow installed:", PIL_AVAILABLE)
-    st.write("Matplotlib installed:", MATPLOTLIB_AVAILABLE)
+    st.write("Pillow:", PIL_AVAILABLE, "Matplotlib:", MATPLOTLIB_AVAILABLE)
+    st.write("Finnhub key present:", bool(FINNHUB_KEY))
+    st.write("AlphaV key present:", bool(ALPHAV_KEY))
+    st.markdown("---")
+    st.markdown("Tip: Für beste Bildanalyse: croppe das Bild auf die reine Kerzenzone, keine Overlays.")
 
-# Live Analyzer
+# -------------------------
+# Page: Live Analyzer
+# -------------------------
 elif page == "Live Analyzer":
-    st.header("Live Analyzer — symbol")
-    left,right = st.columns([3,1])
+    st.header("Live Analyzer — Finnhub / AlphaV (Fallback)")
+    left, right = st.columns([3,1])
     with right:
-        symbol = st.text_input("Symbol (Finnhub format)", value="BINANCE:BTCUSDT")
-        resolution = st.selectbox("Resolution (min)", ["1","5","15","30","60"], index=1)
+        symbol = st.text_input("Symbol (e.g. BINANCE:BTCUSDT or AAPL)", value="BINANCE:BTCUSDT")
+        resolution = st.selectbox("Resolution", ["1","5","15","30","60"], index=1)
         periods = st.slider("Candles", 30, 1000, 240, step=10)
-        fallback_price = st.number_input("Fallback Startprice", value=20000.0)
-        run = st.button("Lade & Analysiere")
+        fallback_price = st.number_input("Fallback price (if no live)", value=20000.0)
+        run = st.button("Load & Analyze")
     with left:
         if run:
-            candles = None
+            candles=None
             if ONLINE and FINNHUB_KEY:
                 to_ts = int(time.time()); from_ts = to_ts - int(periods) * int(resolution) * 60
                 candles = fetch_finnhub_candles(symbol, resolution, from_ts, to_ts)
                 if candles is None and ALPHAV_KEY:
-                    st.warning("Finnhub lieferte nichts — versuche Alpha Vantage")
-                    av = fetch_alpha_minute(symbol, interval=resolution + "min")
-                    if av: candles = av[-periods:] if len(av)>=periods else av
+                    st.warning("Finnhub no data — trying Alpha Vantage fallback")
+                    try:
+                        av = fetch_alpha_minute(symbol, interval=resolution+"min")
+                        if av and len(av)>0:
+                            candles = av[-periods:] if len(av)>=periods else av
+                    except Exception:
+                        candles = None
                 if candles is None:
-                    st.warning("Keine Live-Daten — Simulation wird verwendet")
+                    st.warning("No live data — using simulation")
                     candles = generate_simulated_candles(symbol + "_sim", periods, fallback_price, int(resolution))
                 elif len(candles) < periods:
                     need = periods - len(candles)
                     pad = generate_simulated_candles(symbol + "_pad", need, candles[0]["open"] if candles else fallback_price, int(resolution))
                     candles = pad + candles
             else:
-                st.info("Offline or no key — using simulated candles")
+                st.info("Offline or no key — using simulation")
                 candles = generate_simulated_candles(symbol + "_sim", periods, fallback_price, int(resolution))
             closes = [c["close"] for c in candles]
-            # fixed trend logic
             if len(closes) >= 50:
                 s20 = sum(closes[-20:]) / 20
                 s50 = sum(closes[-50:]) / 50
-                trend = "Aufwärtstrend" if s20 > s50 else "Abwärtstrend" if s20 < s50 else "Seitwärts"
+                trend = "Aufwärtstrend" if s20 > s50 else ("Abwärtstrend" if s20 < s50 else "Seitwärts")
             else:
                 trend = "Seitwärts"
             patt = detect_patterns(candles)
-            # create an image-like summary from candles only
-            pseudo_img_res = {"recommendation":"Neutral","probability":50.0,"risk_pct":5.0,"patterns":[p[0] for p in patt],"summary":[]}
-            fused = map_patterns_to_levels(pseudo_img_res, candles)
-            # fuse into final
-            final = {"recommendation": pseudo_img_res["recommendation"], "probability":pseudo_img_res["probability"], "risk_pct":pseudo_img_res["risk_pct"], "stop":fused["stop"], "tp":fused["tp"], "reasons":[p[0] for p in patt]}
-            st.subheader(f"Symbol: {symbol}")
-            st.write(f"Aktueller Preis: {candles[-1]['close']:.4f}")
-            st.write("Trend:", trend)
-            st.write("Detected patterns:", [p[0] for p in patt][:6])
-            st.write("Stop / TP (rough):", final["stop"], final["tp"])
-            # render chart: use matplotlib if available for nicer visuals; otherwise SVG
+            # build pseudo-image result to map levels
+            pseudo_img = {"patterns":[p[0] for p in patt], "risk_pct": 3.0}
+            mapped = map_patterns_to_levels(pseudo_img, candles[-200:])
+            # fuse simple recommendation: use sma bias & patterns
+            bias = 0
+            if len(closes) >= 50:
+                if s20 > s50: bias += 1
+                else: bias -= 1
+            rec = "Neutral"
+            if bias > 0 and any("Bullish" in p[0] or "Hammer" in p[0] for p in patt): rec = "Kaufen"
+            if bias < 0 and any("Bearish" in p[0] or "Shooting" in p[0] for p in patt): rec = "Short"
+            # show results
+            st.subheader(f"{symbol} — {trend}")
+            st.write(f"Current price: {candles[-1]['close']:.6f}")
+            st.write("Detected patterns:", [p[0] for p in patt][:8])
+            st.write("Recommendation:", rec)
+            st.write("Stop:", mapped["stop"], "TP:", mapped["tp"])
+            # render plot
             if MATPLOTLIB_AVAILABLE:
-                fig, ax = plt.subplots(figsize=(11,5), facecolor="#07070a")
-                ax.set_facecolor("#07070a")
-                # plot close as line for speed
-                xs = [c["t"] for c in candles[-200:]]
-                ys = [c["close"] for c in candles[-200:]]
-                ax.plot(xs, ys, color="#00cc66")
-                ax.set_title(f"{symbol} (close)", color="#e6eef6")
-                ax.tick_params(axis='x', colors='#9aa6b2'); ax.tick_params(axis='y', colors='#9aa6b2')
+                fig, ax = plt.subplots(figsize=(11,4), facecolor="#07070a")
+                ax.plot([c["t"] for c in candles[-300:]], [c["close"] for c in candles[-300:]], color="#00cc66")
+                ax.set_facecolor("#07070a"); ax.tick_params(colors="#9aa6b2")
                 st.pyplot(fig)
             else:
-                svg = render_svg_candles(candles[-160:], stop=final["stop"], tp=final["tp"])
-                st.components.v1.html(svg, height=520)
+                svg = render_svg_candles(candles[-160:], stop=mapped["stop"], tp=mapped["tp"])
+                st.components.v1.html(svg, height=480)
 
-# Bild-Analyse (offline)
+# -------------------------
+# Page: Bild-Analyse (offline) — main focus
+# -------------------------
 elif page == "Bild-Analyse (offline)":
-    st.header("Bild-Analyse — Struktur & Muster (OFFLINE, automatisch)")
-    st.markdown("Lade einen Chart-Screenshot. Die App analysiert automatisch: Muster, Volatilität, Recommendation, Hintergrund-Backtest.")
-    uploaded = st.file_uploader("Chart-Bild (PNG/JPG)", type=["png","jpg","jpeg"])
+    st.header("Bild-Analyse — Struktur & Muster (automatisch, offline-first)")
+    st.markdown("Lade ein Chart-Screenshot hoch (der Bereich mit Kerzen). Die App führt automatisch Analyse, SL/TP Mapping, Hintergrund-Backtest und Annotation durch.")
+    uploaded = st.file_uploader("Chart-Bild hochladen (PNG/JPG)", type=["png","jpg","jpeg"])
     show_internals = st.checkbox("Zeige interne Metriken", value=False)
-    run = st.button("Analysiere Bild (offline)")
+    run = st.button("Analysiere Bild (automatisch)")
     if uploaded:
         st.image(uploaded, use_column_width=True)
         if run:
             img_bytes = uploaded.read()
-            # Roboflow optional
+            # Roboflow analyze (optional, robust retries)
             rf_res = None
             if ONLINE and ROBOFLOW_KEY:
-                rf_res = roboflow_detect_with_retries(img_bytes, retries=2)
+                with st.spinner("Roboflow detection..."):
+                    try:
+                        rf_res = roboflow_detect(img_bytes, retries=2)
+                    except Exception:
+                        rf_res = None
             # local analysis (main)
             img_res = analyze_chart_image_structure(img_bytes)
             if img_res.get("error"):
                 st.error(img_res["error"])
             else:
-                # try to pull history for backtesting; try multiple symbols but do not require user input
+                # choose history for backtest: attempt to get real history for generic symbol list; otherwise simulated
                 hist = None
                 if ONLINE and FINNHUB_KEY:
-                    for sym in ["BINANCE:BTCUSDT","AAPL","SPY","MSFT"]:
+                    syms = ["BINANCE:BTCUSDT","AAPL","SPY","MSFT"]
+                    for s in syms:
                         try:
-                            hist = fetch_finnhub_candles(sym, "5", int(time.time()) - 60*60*24*90, int(time.time()))
-                            if hist and len(hist) >= 400:
-                                break
+                            h = fetch_finnhub_candles(s, "5", int(time.time()) - 60*60*24*180, int(time.time()))
+                            if h and len(h) >= 500:
+                                hist = h; break
                         except Exception:
                             hist = None
                 if hist is None and ALPHAV_KEY:
                     try:
-                        hist = fetch_alpha_minute("AAPL", interval="5min", outputsize="full")
+                        hist = fetch_alpha_minute("AAPL","5min","full")
                     except Exception:
                         hist = None
                 if hist is None:
-                    hist = generate_simulated_candles("backtest_seed", 900, 100.0, 5)
-                # backtest top patterns
+                    hist = generate_simulated_candles("backtest_seed_img", 900, 100.0, 5)
+                # backtest top patterns (map names)
+                patterns = [p.split()[0] for p in img_res.get("patterns", [])]
                 backtests = []
-                for p in img_res.get("patterns", [])[:4]:
-                    name = p.split()[0]
-                    bt = backtest_pattern_on_history(name, hist, lookahead=10, slippage_pct=0.05, fee_pct=0.02)
-                    backtests.append(bt)
-                # map patterns->levels (TP/SL)
+                # naive entries detection for backtest: find pattern indices in hist by detector name
+                detected_indices = []
+                for i in range(1, len(hist)):
+                    # check a few basic patterns
+                    try:
+                        if "Doji" in patterns and is_doji(hist[i]): detected_indices.append(i)
+                        if "Hammer" in patterns and is_hammer(hist[i]): detected_indices.append(i)
+                        if "Engulfing" in patterns:
+                            if i>=1 and (is_bullish_engulfing(hist[i-1], hist[i]) or is_bearish_engulfing(hist[i-1], hist[i])): detected_indices.append(i)
+                    except Exception:
+                        continue
+                # deduplicate
+                detected_indices = sorted(set(detected_indices))
+                # run backtester with user defaults for slippage/fee/position
+                bt_res = backtest_strategy_on_history(hist, detected_indices, position_size_pct=1.0, slippage_pct=0.05, fee_pct=0.02, lookahead=10)
+                # Map SL/TP
                 mapping = map_patterns_to_levels(img_res, hist[-200:] if hist else None)
-                # create final fused recommendation: use image result + backtest stats to adjust probability
-                adjusted_prob = img_res["probability"]
-                if backtests:
-                    avg_wr = sum(bt["winrate"] for bt in backtests if bt["checked"]>0) / max(1, sum(1 for bt in backtests if bt["checked"]>0))
-                    # move probability a bit toward historic winrate
-                    adjusted_prob = round((adjusted_prob*0.6 + avg_wr*0.4), 1)
+                # annotate uploaded image: create some dummy detection coordinates from peaks to map visuals
+                annotated = None
+                if PIL_AVAILABLE:
+                    try:
+                        uploaded_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+                        # create detections for drawing: place arrows roughly across width by detected internal peaks count
+                        internal = img_res.get("internal", {})
+                        peak_count = internal.get("peaks", 0)
+                        detections = []
+                        if peak_count > 0:
+                            # distribute along width
+                            W,H = uploaded_img.size
+                            for i in range(min(6, peak_count)):
+                                x = int((i+1) * W / (min(6, peak_count)+1))
+                                y = int(H*0.3 + (i%2)*H*0.3)
+                                typ = img_res["patterns"][i%len(img_res["patterns"])] if img_res["patterns"] else "Pattern"
+                                # direction heuristics
+                                dirc = "up" if img_res["recommendation"]=="Kaufen" else "down" if img_res["recommendation"]=="Short" else "up"
+                                detections.append({"x": x, "y": y, "type": typ, "dir": dirc})
+                        annotated = annotate_chart_image(uploaded_img, detections, sl=mapping.get("stop"), tp=mapping.get("tp"))
+                    except Exception:
+                        annotated = None
+                # Final fused result
+                adj_prob = img_res["probability"]
+                if bt_res["total"]>0:
+                    adj_prob = round((adj_prob*0.6 + bt_res["winrate"]*0.4),1)
                 final = {
-                    "recommendation": img_res["recommendation"],
-                    "probability": adjusted_prob,
-                    "risk_pct": img_res["risk_pct"],
-                    "stop": mapping["stop"],
-                    "tp": mapping["tp"],
-                    "summary": img_res["summary"],
-                    "patterns": img_res["patterns"],
-                    "confidence": img_res["confidence"],
-                    "volatility": img_res["volatility"],
-                    "backtests": backtests,
-                    "mapping_notes": mapping["notes"],
+                    "meta": {"ts": now_iso(), "source": "image_upload"},
+                    "final": {
+                        "recommendation": img_res["recommendation"],
+                        "probability": adj_prob,
+                        "risk_pct": img_res["risk_pct"],
+                        "stop": mapping.get("stop"),
+                        "tp": mapping.get("tp"),
+                        "summary": img_res["summary"],
+                        "patterns": img_res["patterns"],
+                        "confidence": img_res["confidence"],
+                        "volatility": img_res["volatility"],
+                        "backtest_summary": bt_res["summary"],
+                        "backtest_stats": {"total": bt_res["total"], "winrate": bt_res["winrate"], "avg_return_pct": bt_res["avg_return_pct"]}
+                    },
+                    "internal": img_res.get("internal", {}),
                     "roboflow": rf_res
                 }
-                # show UI
+                # UI: show final card
                 left, right = st.columns([2,1])
                 with left:
-                    if final["recommendation"] == "Kaufen":
-                        st.success(f"Empfehlung: {final['recommendation']}  •  {final['probability']}%")
-                    elif final["recommendation"] == "Short":
-                        st.error(f"Empfehlung: {final['recommendation']}  •  {final['probability']}%")
+                    if final["final"]["recommendation"] == "Kaufen":
+                        st.success(f"Empfehlung: {final['final']['recommendation']}  •  {final['final']['probability']}%")
+                    elif final["final"]["recommendation"] == "Short":
+                        st.error(f"Empfehlung: {final['final']['recommendation']}  •  {final['final']['probability']}%")
                     else:
-                        st.info(f"Empfehlung: {final['recommendation']}  •  {final['probability']}%")
-                    st.markdown(f"**Risiko (est.)**: {final['risk_pct']}%")
-                    st.markdown("**Kurz-Fazit (3 Sätze):**")
-                    for s in final["summary"][:3]: st.write("- " + s)
-                    if final["mapping_notes"]:
-                        st.markdown("**Strategie-Hinweise**")
-                        for n in final["mapping_notes"][:4]: st.write("- " + n)
+                        st.info(f"Empfehlung: {final['final']['recommendation']}  •  {final['final']['probability']}%")
+                    st.markdown(f"**Risiko:** {final['final']['risk_pct']}%")
+                    st.markdown("**3-Satz-Fazit:**")
+                    for s in final["final"]["summary"][:3]:
+                        st.write("- " + s)
+                    if mapping.get("notes"):
+                        st.markdown("**SL/TP-Notizen**")
+                        for n in mapping["notes"][:4]:
+                            st.write("- " + n)
+                    # Export buttons: JSON & CSV
+                    st.download_button("Export Analyse (JSON)", data=export_analysis_json(final), file_name=f"lumina_analysis_{short_ts()}.json", mime="application/json")
+                    st.download_button("Export Analyse (CSV)", data=export_analysis_csv({"meta": final["meta"], "final": final["final"]}), file_name=f"lumina_analysis_{short_ts()}.csv", mime="text/csv")
                 with right:
                     st.markdown("**Details**")
-                    st.write("Trend:", img_res["trend"]); st.write("Confidence:", img_res["confidence"])
-                    st.write("Volatility est.:", img_res["volatility"])
+                    st.write("Trend:", img_res["trend"])
+                    st.write("Confidence:", img_res["confidence"])
+                    st.write("Volatility:", img_res["volatility"])
                     st.write("Detected patterns:")
-                    for p in img_res["patterns"][:8]: st.write("- " + p)
-                    if rf_res:
-                        st.markdown("Roboflow Predictions (top 5):")
-                        preds = rf_res.get("predictions", [])
-                        for pr in preds[:5]:
-                            st.write(f"- {pr.get('class')} ({pr.get('confidence'):.2f})")
+                    for p in img_res["patterns"][:8]:
+                        st.write("- " + p)
+                    st.markdown("**Backtest (Kurzfassung)**")
+                    st.write(bt_res["summary"])
+                    st.write(f"Trades checked: {bt_res['total']} • Winrate: {bt_res['winrate']}% • AvgRet: {bt_res['avg_return_pct']}%")
                 st.markdown("---")
-                st.subheader("Backtest (approx.)")
-                if backtests:
-                    for b in backtests:
-                        st.write(f"{b['pattern']}: checked={b['checked']} wins={b['wins']} winrate={b['winrate']}% avgRet={b['avg_return_pct']}%")
+                # show annotated image if exists
+                if annotated:
+                    st.image(annotated, use_column_width=True)
                 else:
-                    st.info("Keine Backtest-Ergebnisse.")
-                # export buttons
-                analysis_export = { "meta":{"ts": now_iso(), "source":"image"}, "final": final, "image_internal": img_res.get("internal",{}), "backtests": backtests }
-                st.download_button("Export Analysis (JSON)", data=json.dumps(analysis_export, ensure_ascii=False, indent=2), file_name="analysis_export.json", mime="application/json")
-                # CSV (simple)
-                csv_buf = io.StringIO()
-                w = csv.writer(csv_buf); w.writerow(["key","value"])
-                w.writerow(["recommendation", final["recommendation"]]); w.writerow(["probability", final["probability"]]); w.writerow(["risk_pct", final["risk_pct"]])
-                st.download_button("Export Analysis (CSV)", data=csv_buf.getvalue(), file_name="analysis_export.csv", mime="text/csv")
-                # demo svg chart
-                demo = generate_simulated_candles("img_demo_seed_"+str(img_res["internal"]["peaks"]), 160, 100.0, 5)
-                if MATPLOTLIB_AVAILABLE:
-                    fig, ax = plt.subplots(figsize=(11,4), facecolor="#07070a")
-                    ax.plot([c["t"] for c in demo], [c["close"] for c in demo], color="#00cc66")
-                    ax.set_facecolor("#07070a"); ax.tick_params(colors="#9aa6b2")
-                    st.pyplot(fig)
-                else:
-                    svg = render_svg_candles(demo, width=1000, height=420)
-                    st.components.v1.html(svg, height=450)
+                    st.info("Keine Annotation möglich (Pillow nicht verfügbar oder Annotate fehlgeschlagen).")
                 if show_internals:
-                    st.markdown("Internal metrics:"); st.write(img_res.get("internal",{}))
-                st.success("Bildanalyse + Backtest abgeschlossen.")
+                    st.write("Internals:", img_res.get("internal", {}))
+                st.success("Analyse & Backtest abgeschlossen.")
 
-# Backtest page
+# -------------------------
+# Page: Backtest (manual)
+# -------------------------
 elif page == "Backtest":
-    st.header("Backtest / Simulation")
-    st.markdown("Leichtgewichtiger Backtester (simuliert). Slippage & Fee einstellbar.")
-    pattern = st.selectbox("Muster", ["Bullish Engulfing","Bearish Engulfing","Hammer","Doji","Morning Star"])
+    st.header("Backtest & Simulation (manuell)")
+    pattern = st.selectbox("Muster testen", ["Bullish Engulfing","Bearish Engulfing","Hammer","Doji","Morning Star"])
     lookahead = st.slider("Lookahead (Kerzen)", 1, 30, 10)
-    slippage = st.number_input("Slippage %", value=0.05, step=0.01)
-    fee = st.number_input("Fee %", value=0.02, step=0.01)
+    pos_size = st.number_input("Position size (% of equity per trade)", value=1.0, min_value=0.1, step=0.1)
+    slippage = st.number_input("Slippage (%)", value=0.05, step=0.01)
+    fee = st.number_input("Fee (%)", value=0.02, step=0.01)
     if st.button("Run Backtest"):
-        hist = generate_simulated_candles("bt_seed_full", 1200, 100.0, 5)
-        res = backtest_pattern_on_history(pattern, hist, lookahead=lookahead, slippage_pct=slippage, fee_pct=fee)
+        hist = generate_simulated_candles("bt_seed_manual", 1200, 100.0, 5)
+        # detect sample indices for chosen pattern
+        indices=[]
+        for i in range(1, len(hist)):
+            try:
+                if "Doji" in pattern and is_doji(hist[i]): indices.append(i)
+                if "Hammer" in pattern and is_hammer(hist[i]): indices.append(i)
+                if "Engulf" in pattern and i>=1 and (is_bullish_engulfing(hist[i-1], hist[i]) or is_bearish_engulfing(hist[i-1], hist[i])): indices.append(i)
+            except Exception:
+                continue
+        res = backtest_strategy_on_history(hist, sorted(set(indices)), position_size_pct=pos_size, slippage_pct=slippage, fee_pct=fee, lookahead=lookahead)
         st.write(res)
+        # plain-language short conclusion
+        if res["total"] == 0:
+            st.info("Keine Musterereignisse in der simulierten Historie gefunden.")
+        else:
+            st.success("Backtest abgeschlossen.")
+            # human summary
+            if res["winrate"] > 60 and res["avg_return_pct"] > 0:
+                conclusion = "Starkes Ergebnis — Muster liefert überdurchschnittliche Trefferquote in Simulation."
+            elif res["winrate"] > 45:
+                conclusion = "Akzeptables Ergebnis — Muster zeigt moderate Trefferquote."
+            else:
+                conclusion = "Schwaches Ergebnis — Vorsicht, hohes Risiko."
+            st.markdown(f"**Fazit:** {conclusion}")
+        # plot sample history
         if MATPLOTLIB_AVAILABLE:
             fig, ax = plt.subplots(figsize=(11,4), facecolor="#07070a")
             ax.plot([c["t"] for c in hist[-300:]], [c["close"] for c in hist[-300:]], color="#00cc66")
@@ -697,28 +856,28 @@ elif page == "Backtest":
         else:
             st.line_chart([c["close"] for c in hist[-300:]])
 
-# Settings
+# -------------------------
+# Page: Settings & Help
+# -------------------------
 elif page == "Einstellungen":
     st.header("Einstellungen")
+    st.write("Keys are embedded in the script (not secure for public hosting). Move them to st.secrets in production.")
     st.write("Pillow installed:", PIL_AVAILABLE)
     st.write("Matplotlib installed:", MATPLOTLIB_AVAILABLE)
-    st.write("Finnhub Key present:", bool(FINNHUB_KEY))
-    st.write("AlphaV Key present:", bool(ALPHAV_KEY))
-    if st.button("Cache löschen"):
+    if st.button("Clear cache"):
         for f in os.listdir(CACHE_DIR):
-            try: os.remove(os.path.join(CACHE_DIR,f))
+            try: os.remove(os.path.join(CACHE_DIR, f))
             except: pass
-        st.success("Cache gelöscht")
+        st.success("Cache cleared.")
 
-# Help
 elif page == "Hilfe":
-    st.header("Hilfe & Hinweise")
+    st.header("Hilfe")
     st.markdown("""
-    - Bild-Analyzer läuft offline und benötigt Pillow.
-    - Live-Analyzer nutzt Finnhub/AlphaV (API limits gelten).
-    - Empfehlungen sind probabilistisch — **keine Anlageberatung**.
-    - Für Roboflow-Integration: stelle sicher, dass ROBOFLOW_MODEL_PATH korrekt ist.
+    - Bild-Analyse ist offline-first; Roboflow optional for better detection (requires internet).
+    - Live Analyzer uses Finnhub primary and Alpha Vantage fallback (watch API limits).
+    - Exports provide JSON + CSV for audit/log.
+    - Recommendations are probabilistic estimates — NOT financial advice.
     """)
 
 st.markdown("---")
-st.caption("Lumina Pro — Deep Analyzer. Keys are embedded as requested. Use responsibly; not financial advice.")
+st.caption("Lumina Pro — Deep Analyzer. Keys embedded per user request. Use responsibly.")

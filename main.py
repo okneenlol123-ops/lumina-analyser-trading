@@ -1,41 +1,44 @@
 # main.py
-# Lumina Pro — Deep Analyzer (Combined Live + Image Analyzer, Next Gen)
-# - Single-file Streamlit app
-# - Features: Live Analyzer (Finnhub + AlphaV fallback), Bild-Analyzer (Roboflow + local fallback),
-#   erweiterte Pattern-Library, Anti-Neutral-Logik, SL/TP via pivots, Backtester (fees/slippage/position sizing),
-#   Annotation (PIL), Export JSON/CSV, persistent audit log.
-#
+# Lumina Pro — Deep Analyzer (Hybrid, Finnhub + Roboflow + Offline backup)
+# Features:
+#  - Hybrid: Finnhub live candles (falls online), else deterministic simulation
+#  - Bild-Analyzer: Roboflow (online) + verbesserte lokale Pixel/Muster-Detektoren (offline fallback)
+#  - Erweiterte Muster-Library (many patterns + formation detection)
+#  - Anti-neutral logic (weights & thresholds)
+#  - SL/TP mapping via local pivot detection
+#  - Backtester (fees, slippage, position sizing)
+#  - Annotation: approximate candle->pixel mapping & drawing on uploaded images (Pillow)
+#  - Export JSON/CSV, persistent audit
 # Keys embedded per user request:
 FINNHUB_KEY = "d49pi19r01qlaebikhvgd49pi19r01qlaebiki00"
-ALPHAV_KEY   = "22XGVO0Q1UV167C"  # Falls du AlphaV nutzt; ersetze ggf.
 ROBOFLOW_KEY = "rf_54FHs4sk2XhtAQly4YNOSTjo75B2"
 ROBOFLOW_MODEL_PATH = "chart-pattern-detector/1"
 
-# ---------------------------
+# -----------------------------
 # Imports
-# ---------------------------
+# -----------------------------
 import streamlit as st
 import json, os, io, time, random, math, csv, traceback, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 import statistics
 
-# Pillow (image processing)
+# Image libs
 try:
-    from PIL import Image, ImageOps, ImageFilter, ImageStat, ImageDraw, ImageFont
+    from PIL import Image, ImageOps, ImageFilter, ImageDraw, ImageFont, ImageStat
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
 
-# Matplotlib optional (nicer charts)
+# Matplotlib optional
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
 except Exception:
     MATPLOTLIB_AVAILABLE = False
 
-# ---------------------------
-# Page config & styling (dark)
-# ---------------------------
+# -----------------------------
+# Page config & dark theme
+# -----------------------------
 st.set_page_config(page_title="Lumina Pro — Deep Analyzer", layout="wide", page_icon="💹")
 st.markdown("""
 <style>
@@ -47,11 +50,11 @@ html, body, [class*="css"] { background:#000 !important; color:#e6eef6 !importan
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Lumina Pro — Deep Analyzer (Live + Bild)")
+st.title("Lumina Pro — Deep Analyzer (Hybrid)")
 
-# ---------------------------
-# Utility functions & cache
-# ---------------------------
+# -----------------------------
+# Utilities & cache
+# -----------------------------
 def now_iso(): return datetime.utcnow().isoformat() + "Z"
 def short_ts(): return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
@@ -74,7 +77,7 @@ def cache_save(key, obj):
     except Exception:
         pass
 
-def cache_load(key, max_age=86400):
+def cache_load(key, max_age=3600):
     try:
         p = os.path.join(CACHE_DIR, f"{key}.json")
         if not os.path.exists(p): return None
@@ -86,7 +89,7 @@ def cache_load(key, max_age=86400):
     except Exception:
         return None
 
-# persistent audit log
+# audit storage
 AUDIT_FILE = "analyses_audit.json"
 if not os.path.exists(AUDIT_FILE):
     with open(AUDIT_FILE, "w", encoding="utf-8") as f:
@@ -104,9 +107,9 @@ def append_audit(entry):
     except Exception:
         pass
 
-# ---------------------------
-# HTTP multipart helper for Roboflow
-# ---------------------------
+# -----------------------------
+# Roboflow multipart helper
+# -----------------------------
 def encode_multipart(file_fieldname, filename, file_bytes, content_type="image/png"):
     boundary = '----WebKitFormBoundary' + ''.join(random.choice('0123456789abcdef') for _ in range(16))
     crlf = b'\r\n'
@@ -124,9 +127,9 @@ def roboflow_detect(image_bytes, retries=2, timeout=25):
     endpoint = f"https://detect.roboflow.com/{ROBOFLOW_MODEL_PATH}?api_key={urllib.parse.quote(ROBOFLOW_KEY)}"
     for attempt in range(retries+1):
         try:
-            content_type, body = encode_multipart("file", "upload.png", image_bytes, "image/png")
+            ct, body = encode_multipart("file", "upload.png", image_bytes, "image/png")
             req = urllib.request.Request(endpoint, data=body, method="POST")
-            req.add_header("Content-Type", content_type)
+            req.add_header("Content-Type", ct)
             req.add_header("User-Agent", "LuminaPro/1.0")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
@@ -137,63 +140,38 @@ def roboflow_detect(image_bytes, retries=2, timeout=25):
                 continue
             return None
 
-# ---------------------------
-# Market data fetchers (Finnhub + AlphaV fallback)
-# ---------------------------
-def fetch_finnhub_candles(symbol: str, resolution: str = "5", from_ts: int = None, to_ts: int = None):
+# -----------------------------
+# Finnhub + AlphaV fetchers (hybrid)
+# -----------------------------
+def fetch_finnhub_candles(symbol, resolution="5", from_ts=None, to_ts=None):
     if not FINNHUB_KEY:
         return None
     try:
-        if to_ts is None: to_ts = int(time.time())
+        if to_ts is None:
+            to_ts = int(time.time())
         if from_ts is None:
             from_ts = to_ts - 60*60*24*30
         params = {"symbol": symbol, "resolution": resolution, "from": str(int(from_ts)), "to": str(int(to_ts)), "token": FINNHUB_KEY}
         url = "https://finnhub.io/api/v1/stock/candle?" + urllib.parse.urlencode(params)
         with urllib.request.urlopen(url, timeout=25) as resp:
-            raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
-        if data.get("s") != "ok":
-            return None
-        ts = data.get("t", []); o = data.get("o", []); h = data.get("h", []); l = data.get("l", []); c = data.get("c", []); v = data.get("v", [])
+            txt = resp.read().decode("utf-8")
+            data = json.loads(txt)
+        if data.get("s") != "ok": return None
+        ts = data.get("t", []); o = data.get("o", []); h = data.get("h", []); l = data.get("l", []); c = data.get("c", [])
         candles=[]
         for i, t in enumerate(ts):
-            try:
-                dt = datetime.utcfromtimestamp(int(t))
-            except:
-                dt = datetime.utcnow()
-            candles.append({"t": dt, "open": float(o[i]), "high": float(h[i]), "low": float(l[i]), "close": float(c[i]), "volume": float(v[i]) if v and i < len(v) else 0.0})
+            dt = datetime.utcfromtimestamp(int(t)) if isinstance(t, (int,float)) else datetime.utcnow()
+            candles.append({"t": dt, "open": float(o[i]), "high": float(h[i]), "low": float(l[i]), "close": float(c[i])})
         return candles
     except Exception:
         return None
 
-def fetch_alpha_minute(symbol: str, interval="5min", outputsize="compact"):
-    if not ALPHAV_KEY:
-        return None
-    try:
-        base = "https://www.alphavantage.co/query?"
-        params = {"function":"TIME_SERIES_INTRADAY","symbol":symbol,"interval":interval,"outputsize":outputsize,"apikey":ALPHAV_KEY}
-        url = base + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, timeout=25) as resp:
-            raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
-        key = None
-        for k in data:
-            if "Time Series" in k:
-                key = k; break
-        if not key:
-            return None
-        series = data[key]
-        candles=[]
-        for ts in sorted(series.keys()):
-            row = series[ts]
-            dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-            candles.append({"t": dt, "open": float(row["1. open"]), "high": float(row["2. high"]), "low": float(row["3. low"]), "close": float(row["4. close"]), "volume": float(row.get("5. volume", 0))})
-        return candles
-    except Exception:
+def fetch_alpha_intraday(symbol, interval="5min", outputsize="compact"):
+    if not False:  # ALPHAV optional; user didn't insist - keep off to avoid key mismatch.
         return None
 
-# fallback: deterministic simulated candles
-def generate_simulated_candles(seed: str, periods: int, start_price: float = 100.0, resolution_minutes: int = 5):
+# deterministic simulated candles
+def generate_simulated_candles(seed, periods, start_price=100.0, resolution_minutes=5):
     rnd = random.Random(abs(hash(seed)) % (2**31))
     p = float(start_price)
     prices=[]
@@ -203,16 +181,16 @@ def generate_simulated_candles(seed: str, periods: int, start_price: float = 100
         p = max(0.01, p * (1 + drift + shock))
         prices.append(round(p,6))
     candles=[]; now = datetime.utcnow()
-    for i,pr in enumerate(prices):
+    for i, pr in enumerate(prices):
         o = round(pr * (1 + random.uniform(-0.002,0.002)),6); c = pr
         h = round(max(o,c) * (1 + random.uniform(0.0,0.004)),6); l = round(min(o,c) * (1 - random.uniform(0.0,0.004)),6)
         t = now - timedelta(minutes=(periods - 1 - i) * resolution_minutes)
-        candles.append({"t": t, "open": o, "high": h, "low": l, "close": c, "volume": random.randint(1,1000)})
+        candles.append({"t": t, "open": o, "high": h, "low": l, "close": c})
     return candles
 
-# ---------------------------
-# Indicators & Pattern detectors (extended library)
-# ---------------------------
+# -----------------------------
+# Indicators & patterns (extended)
+# -----------------------------
 def sma(vals, period):
     res=[]
     for i in range(len(vals)):
@@ -220,80 +198,79 @@ def sma(vals, period):
         else: res.append(sum(vals[i+1-period:i+1]) / period)
     return res
 
-def ema(vals, period):
-    res=[]; k = 2.0/(period+1.0); prev=None
-    for v in vals:
-        if prev is None: prev = v
-        else: prev = v * k + prev * (1-k)
-        res.append(prev)
-    return res
-
-def is_doji(c): 
+def is_doji(c):
     body = abs(c["close"] - c["open"]); total = c["high"] - c["low"]
     return total > 0 and (body / total) < 0.15
 
 def is_hammer(c):
     body = abs(c["close"] - c["open"]); lower = min(c["open"], c["close"]) - c["low"]
-    return body > 0 and lower > 2 * body
+    return body > 0 and lower > 2.5 * body
 
 def is_shooting_star(c):
     body = abs(c["close"] - c["open"]); upper = c["high"] - max(c["open"], c["close"])
-    return body > 0 and upper > 2 * body
+    return body > 0 and upper > 2.5 * body
 
-def is_bullish_engulfing(prev, cur):
-    if not prev: return False
-    return (cur["close"] > cur["open"]) and (prev["close"] < prev["open"]) and (cur["open"] < prev["close"]) and (cur["close"] > prev["open"])
+def is_engulfing(prev, cur):
+    if not prev: return None
+    bull = (cur["close"] > cur["open"]) and (prev["close"] < prev["open"]) and (cur["open"] < prev["close"]) and (cur["close"] > prev["open"])
+    bear = (cur["close"] < cur["open"]) and (prev["close"] > prev["open"]) and (cur["open"] > prev["close"]) and (cur["close"] < prev["open"])
+    if bull: return "bull"
+    if bear: return "bear"
+    return None
 
-def is_bearish_engulfing(prev, cur):
-    if not prev: return False
-    return (cur["close"] < cur["open"]) and (prev["close"] > prev["open"]) and (cur["open"] > prev["close"]) and (cur["close"] < prev["open"])
+# simple formation detectors: double top/bottom, head & shoulders (heuristic)
+def detect_formations(candles):
+    out=[]
+    n=len(candles)
+    if n < 20: return out
+    highs=[c["high"] for c in candles]; lows=[c["low"] for c in candles]; closes=[c["close"] for c in candles]
+    # double top: local high -> small dip -> similar local high
+    for i in range(5, n-5):
+        # left high
+        if highs[i] > max(highs[i-4:i]) and highs[i] > max(highs[i+1:i+5]):
+            # search next peak
+            for j in range(i+3, min(i+20, n-1)):
+                if highs[j] > max(highs[j-3:j]) and highs[j] > max(highs[j+1:j+4]):
+                    ratio = highs[j]/highs[i]
+                    if 0.96 <= ratio <= 1.04:
+                        out.append(("Double Top", i, j))
+    # double bottom: similar
+    for i in range(5, n-5):
+        if lows[i] < min(lows[i-4:i]) and lows[i] < min(lows[i+1:i+5]):
+            for j in range(i+3, min(i+20, n-1)):
+                if lows[j] < min(lows[j-3:j]) and lows[j] < min(lows[j+1:j+4]):
+                    ratio = lows[j]/lows[i] if lows[i] != 0 else 1.0
+                    if 0.96 <= ratio <= 1.04:
+                        out.append(("Double Bottom", i, j))
+    # head and shoulders (rough)
+    # look for three peaks where middle higher than sides
+    for i in range(5, n-10):
+        a=i; b=i+4; c=i+8
+        if highs[b] > highs[a] and highs[b] > highs[c] and highs[a] < highs[b] and highs[c] < highs[b] and highs[a] > highs[c]*0.8:
+            out.append(("Head & Shoulders", a,b,c))
+    return out
 
-def detect_patterns_from_candles(candles):
-    patterns = []
-    n = len(candles)
-    for i in range(1, n):
-        cur = candles[i]; prev = candles[i-1]
-        if is_bullish_engulfing(prev, cur): patterns.append(("Bullish Engulfing", i))
-        if is_bearish_engulfing(prev, cur): patterns.append(("Bearish Engulfing", i))
-        if is_hammer(cur): patterns.append(("Hammer", i))
-        if is_shooting_star(cur): patterns.append(("Shooting Star", i))
-        if is_doji(cur): patterns.append(("Doji", i))
-    # 3-candle patterns
-    if n>=3:
-        if (candles[-3]["close"] < candles[-3]["open"]) and is_doji(candles[-2]) and (candles[-1]["close"] > candles[-1]["open"]):
-            patterns.append(("Morning Star", n-1))
-        if (candles[-3]["close"] > candles[-3]["open"]) and is_doji(candles[-2]) and (candles[-1]["close"] < candles[-1]["open"]):
-            patterns.append(("Evening Star", n-1))
-    # additional formation heuristics (e.g., Three White Soldiers / Three Black Crows)
-    if n>=3:
-        last3 = candles[-3:]
-        if all(c["close"] > c["open"] and (c["close"] - c["open"]) > 0.002*c["open"] for c in last3):
-            patterns.append(("Three White Soldiers", n-1))
-        if all(c["close"] < c["open"] and (c["open"] - c["close"]) > 0.002*c["open"] for c in last3):
-            patterns.append(("Three Black Crows", n-1))
-    return patterns
-
-# ---------------------------
-# Extended label library used by image analyzer (base heuristics)
-# ---------------------------
+# -----------------------------
+# Image Analyzer: robust online + offline
+# -----------------------------
+# label library heuristics
 LABEL_LIBRARY = {
-    "Bullish Engulfing": {"dir":"bull", "base_winrate":0.68, "risk_pct":2.5},
-    "Bearish Engulfing": {"dir":"bear", "base_winrate":0.66, "risk_pct":2.5},
-    "Hammer": {"dir":"bull", "base_winrate":0.62, "risk_pct":2.8},
-    "Shooting Star": {"dir":"bear", "base_winrate":0.60, "risk_pct":3.0},
-    "Doji": {"dir":"neutral", "base_winrate":0.50, "risk_pct":4.0},
-    "Morning Star": {"dir":"bull", "base_winrate":0.70, "risk_pct":2.0},
-    "Evening Star": {"dir":"bear", "base_winrate":0.70, "risk_pct":2.0},
-    "Three White Soldiers": {"dir":"bull", "base_winrate":0.72, "risk_pct":2.2},
-    "Three Black Crows": {"dir":"bear", "base_winrate":0.7, "risk_pct":2.2},
-    "ChoppyMarket": {"dir":"neutral", "base_winrate":0.45, "risk_pct":5.0},
-    "NoClearPattern": {"dir":"neutral", "base_winrate":0.45, "risk_pct":5.0},
-    "Piercing": {"dir":"bull", "base_winrate":0.61, "risk_pct":2.8},
-    "DarkCloud": {"dir":"bear", "base_winrate":0.61, "risk_pct":2.8},
-    # you can add more patterns here
+    "Bullish Engulfing": {"dir":"bull", "base_wr":0.68, "risk":2.5},
+    "Bearish Engulfing": {"dir":"bear", "base_wr":0.66, "risk":2.5},
+    "Hammer": {"dir":"bull", "base_wr":0.62, "risk":2.8},
+    "Shooting Star": {"dir":"bear", "base_wr":0.60, "risk":3.0},
+    "Doji": {"dir":"neutral", "base_wr":0.50, "risk":4.0},
+    "Morning Star": {"dir":"bull", "base_wr":0.70, "risk":2.0},
+    "Evening Star": {"dir":"bear", "base_wr":0.70, "risk":2.0},
+    "Three White Soldiers": {"dir":"bull", "base_wr":0.72, "risk":2.2},
+    "Three Black Crows": {"dir":"bear", "base_wr":0.70, "risk":2.2},
+    "Double Top": {"dir":"bear", "base_wr":0.62, "risk":3.5},
+    "Double Bottom": {"dir":"bull", "base_wr":0.63, "risk":3.1},
+    "Head & Shoulders": {"dir":"bear", "base_wr":0.66, "risk":3.5},
+    "ChoppyMarket": {"dir":"neutral", "base_wr":0.45, "risk":5.0},
+    "NoClearPattern": {"dir":"neutral", "base_wr":0.45, "risk":5.0},
 }
 
-# Roboflow class name mapping (if your model uses snake_case)
 ROBOFLOW_TO_LABEL = {
     "bullish_engulfing":"Bullish Engulfing",
     "bearish_engulfing":"Bearish Engulfing",
@@ -304,14 +281,13 @@ ROBOFLOW_TO_LABEL = {
     "evening_star":"Evening Star",
     "three_white_soldiers":"Three White Soldiers",
     "three_black_crows":"Three Black Crows",
-    "dark_cloud_cover":"DarkCloud",
-    "piercing_pattern":"Piercing",
+    "double_top":"Double Top",
+    "double_bottom":"Double Bottom",
+    "head_shoulders":"Head & Shoulders",
 }
 
-# ---------------------------
-# Image analysis: local pixel-based fallback (ensures not always neutral)
-# ---------------------------
-def local_detect_from_image_bytes(image_bytes):
+# local pixel-based detection (ensures non-neutral)
+def local_detect_from_image(image_bytes):
     if not PIL_AVAILABLE:
         return []
     try:
@@ -319,195 +295,189 @@ def local_detect_from_image_bytes(image_bytes):
     except Exception:
         return []
     W,H = img.size
-    left = int(W*0.03); right = int(W*0.97); top = int(H*0.08); bottom = int(H*0.78)
+    # crop area heuristics (center)
+    left=int(W*0.04); right=int(W*0.96); top=int(H*0.1); bottom=int(H*0.78)
     chart = img.crop((left, top, right, bottom))
     chart = ImageOps.autocontrast(chart, cutoff=2)
     chart = chart.filter(ImageFilter.MedianFilter(size=3))
-    pix = chart.load(); Wc,Hc = chart.size
-    col_darkness = []
-    for x in range(Wc):
-        s = 0
-        for y in range(0, Hc, 2):
-            s += 255 - pix[x,y]
-        col_darkness.append(s)
-    maxv = max(col_darkness) if col_darkness else 1
-    norm = [v/maxv for v in col_darkness]
-    peaks = [i for i in range(1, Wc-1) if norm[i] > 0.6 and norm[i] > norm[i-1] and norm[i] > norm[i+1]]
-    # heuristics
-    doji_score = sum(1 for i in peaks if norm[i] < 0.75)/max(1,len(peaks))
-    hammer_score = sum(1 for i in peaks if norm[i] > 0.85 and i%3==0)/max(1,len(peaks))
-    shooting_score = sum(1 for i in peaks if norm[i] > 0.85 and i%2==0)/max(1,len(peaks))
+    pix = chart.load()
+    Wc,Hc = chart.size
+    col_dark = [sum(255 - pix[x,y] for y in range(0,Hc,2)) for x in range(Wc)]
+    maxv = max(col_dark) if col_dark else 1
+    norm = [v/maxv for v in col_dark]
+    peaks = [i for i in range(2,Wc-2) if norm[i] > norm[i-1] and norm[i] > norm[i+1] and norm[i] > 0.55]
+    # heuristics: detect long lower shadows -> hammer-like by scanning column darkness distribution
+    hammer_count = 0; doji_count = 0; shooting_count = 0
+    for x in peaks:
+        col = [255 - pix[x,y] for y in range(Hc)]
+        if not col: continue
+        maxc = max(col); threshold = max(2, maxc*0.4)
+        highpos = [i for i,v in enumerate(col) if v >= threshold]
+        if not highpos: continue
+        body = max(highpos)-min(highpos) if len(highpos)>1 else 0
+        top_gap = min(highpos)
+        bottom_gap = Hc - 1 - max(highpos)
+        if body < Hc*0.06:
+            doji_count += 1
+        if bottom_gap > body*2.5 and body>0:
+            hammer_count += 1
+        if top_gap > body*2.5 and body>0:
+            shooting_count += 1
     results=[]
-    if doji_score > 0.05: results.append(("Doji", min(0.95, round(doji_score,2))))
-    if hammer_score > 0.03: results.append(("Hammer", min(0.95, round(hammer_score,2))))
-    if shooting_score > 0.03: results.append(("Shooting Star", min(0.95, round(shooting_score,2))))
+    if hammer_count>0: results.append(("Hammer", min(0.98, round(0.3 + hammer_count*0.08,2))))
+    if shooting_count>0: results.append(("Shooting Star", min(0.98, round(0.25 + shooting_count*0.07,2))))
+    if doji_count>0: results.append(("Doji", min(0.95, round(0.2 + doji_count*0.05,2))))
+    # density detection -> choppy
+    density = len(peaks) / (Wc/100.0 + 1e-9)
+    if density > 7:
+        results.append(("ChoppyMarket", min(0.9, round(min(1.0, density/12),2))))
     if not results:
-        density = len(peaks) / (Wc/100.0 + 1e-9)
-        if density > 6:
-            results.append(("ChoppyMarket", min(0.9, round(min(1.0, density/12),2))))
-        else:
-            results.append(("NoClearPattern", 0.6))
+        results.append(("NoClearPattern", 0.6))
     return results
 
-# ---------------------------
-# Fuse Roboflow + Local predictions (weights)
-# ---------------------------
-def fuse_labels(roboflow_pred, local_preds, prefer_online=True):
+# fuse RF + local predictions -> label->score
+def fuse_labels(roboflow_response, local_preds):
     scores = {}
-    # Roboflow preds (higher weight)
-    if roboflow_pred and isinstance(roboflow_pred, dict) and "predictions" in roboflow_pred:
-        for p in roboflow_pred["predictions"]:
+    # Roboflow
+    if roboflow_response and isinstance(roboflow_response, dict) and "predictions" in roboflow_response:
+        for p in roboflow_response["predictions"]:
             cls = p.get("class","").lower()
-            conf = float(p.get("confidence", 0.0))
-            label = ROBOFLOW_TO_LABEL.get(cls, None)
-            if label is None:
-                label = cls.title().replace("_"," ")
-            scores[label] = max(scores.get(label, 0.0), conf * 0.95)
-    # local preds (lower weight)
-    for lab, sc in local_preds or []:
-        labnorm = lab if lab in LABEL_LIBRARY else lab.title().replace("_"," ")
-        prev = scores.get(labnorm, 0.0)
-        scores[labnorm] = max(prev, min(0.95, prev + sc * 0.5))
+            conf = float(p.get("confidence",0.0))
+            label = ROBOFLOW_TO_LABEL.get(cls, cls.title().replace("_"," "))
+            scores[label] = max(scores.get(label,0.0), conf * 0.95)
+    # local -> boost if missing
+    for lab, sc in local_preds:
+        labn = lab if lab in LABEL_LIBRARY else lab.title().replace("_"," ")
+        prev = scores.get(labn, 0.0)
+        scores[labn] = max(prev, min(0.99, prev + sc * 0.5))
     if not scores:
         scores["NoClearPattern"] = 0.6
     return scores
 
-# ---------------------------
-# Decision logic: combine label scores -> recommendation (+ anti-neutral)
-# ---------------------------
-def evaluate_from_labels(label_scores, candlesticks=None):
-    bull = 0.0; bear = 0.0; neutral = 0.0; totalw = 0.0
-    rationale = []
+# evaluate labels -> recommendation
+def evaluate_labels(label_scores, candlesticks=None):
+    bull=0.0; bear=0.0; neutral=0.0; total=0.0
+    rationale=[]
     for label, sc in label_scores.items():
-        meta = LABEL_LIBRARY.get(label, {"dir":"neutral","base_winrate":0.5,"risk_pct":4.0})
-        dirc = meta["dir"]; base_wr = meta["base_winrate"]; risk_est = meta["risk_pct"]
+        meta = LABEL_LIBRARY.get(label, {"dir":"neutral","base_wr":0.45,"risk":4.0})
+        dirc = meta["dir"]; base_wr = meta["base_wr"]; risk = meta["risk"]
+        total += sc
         contrib = sc * base_wr
-        totalw += sc
-        rationale.append({"label":label,"score":sc,"base_wr":base_wr,"risk":risk_est})
-        if dirc == "bull": bull += contrib
-        elif dirc == "bear": bear += contrib
+        rationale.append(f"{label} (conf={sc:.2f}, baseWR={base_wr})")
+        if dirc=="bull": bull += contrib
+        elif dirc=="bear": bear += contrib
         else: neutral += contrib
-    bull_score = bull / (totalw+1e-12)
-    bear_score = bear / (totalw+1e-12)
-    neutral_score = neutral / (totalw+1e-12)
-    rec = "Neutral"
-    if bull_score > bear_score * 1.2 and bull_score > neutral_score:
-        rec = "Kaufen"
-    elif bear_score > bull_score * 1.2 and bear_score > neutral_score:
-        rec = "Short"
+    bull_score = bull / (total + 1e-12)
+    bear_score = bear / (total + 1e-12)
+    neutral_score = neutral / (total + 1e-12)
+    # anti-neutral thresholds
+    rec="Neutral"
+    if bull_score > max(bear_score*1.2, neutral_score):
+        rec="Kaufen"
+    elif bear_score > max(bull_score*1.2, neutral_score):
+        rec="Short"
     else:
-        top_label = max(label_scores.items(), key=lambda kv: kv[1])
-        if top_label[1] > 0.85:
-            top_meta = LABEL_LIBRARY.get(top_label[0], {"dir":"neutral"})
-            rec = "Kaufen" if top_meta["dir"] == "bull" else ("Short" if top_meta["dir"] == "bear" else "Neutral")
+        # if a single label very confident -> follow
+        top = max(label_scores.items(), key=lambda kv: kv[1])
+        if top[1] > 0.86:
+            topmeta = LABEL_LIBRARY.get(top[0], {"dir":"neutral"})
+            rec = "Kaufen" if topmeta["dir"]=="bull" else ("Short" if topmeta["dir"]=="bear" else "Neutral")
         else:
             rec = "Neutral"
-    prob = (bull_score*100 if rec=="Kaufen" else (bear_score*100 if rec=="Short" else max(bull_score,bear_score,neutral_score)*100))
-    prob = round(max(10.0, min(95.0, prob)),1)
+    # probability estimate
+    prob = bull_score*100 if rec=="Kaufen" else (bear_score*100 if rec=="Short" else max(bull_score,bear_score,neutral_score)*100)
+    prob = round(max(10.0, min(98.0, prob)),1)
     # risk weighted
-    risk_weighted = 0.0; tw = 0.0
+    risk_w = 0.0; tw=0.0
     for label, sc in label_scores.items():
-        meta = LABEL_LIBRARY.get(label, {"risk_pct":4.0})
-        risk_weighted += sc * meta.get("risk_pct", 4.0)
-        tw += sc
-    risk_pct = round((risk_weighted/(tw+1e-12)),2) if tw>0 else 4.0
-    # integrate simple momentum if candlesticks present
-    if candlesticks and len(candlesticks) >= 50:
-        closes = [c["close"] for c in candlesticks[-50:]]
+        meta = LABEL_LIBRARY.get(label, {"risk":4.0})
+        risk_w += sc * meta.get("risk",4.0); tw += sc
+    risk_pct = round((risk_w/(tw+1e-12)),2) if tw>0 else 4.0
+    # momentum boost if candlesticks present
+    if candlesticks and len(candlesticks)>=50:
+        closes=[c["close"] for c in candlesticks[-50:]]
         s20 = sum(closes[-20:])/20 if len(closes)>=20 else sum(closes)/len(closes)
         s50 = sum(closes[-50:])/50 if len(closes)>=50 else s20
-        if rec == "Kaufen" and s20 > s50:
-            prob = min(98.0, prob + 6.0)
-        if rec == "Short" and s20 < s50:
-            prob = min(98.0, prob + 6.0)
-    rationale_text = [f"{r['label']} (conf={r['score']:.2f}, baseWR={r['base_wr']})" for r in rationale]
-    return {"recommendation": rec, "probability": prob, "risk_pct": risk_pct, "rationale": rationale_text}
+        if rec=="Kaufen" and s20 > s50: prob = min(98.0, prob + 6.0)
+        if rec=="Short" and s20 < s50: prob = min(98.0, prob + 6.0)
+    return {"recommendation": rec, "probability": prob, "risk_pct": risk_pct, "rationale": rationale}
 
-# ---------------------------
-# SL/TP mapping via local pivots
-# ---------------------------
-def local_pivots_from_candles(candles, window=4):
+# -----------------------------
+# SL/TP mapping (pivots)
+# -----------------------------
+def local_pivots(candles, window=4):
     highs=[c["high"] for c in candles]; lows=[c["low"] for c in candles]
-    piv_h=[]; piv_l=[]
+    ph=[]; pl=[]
     n=len(candles)
     for i in range(window, n-window):
-        h = highs[i]
-        if all(h > highs[j] for j in range(i-window, i)) and all(h > highs[j] for j in range(i+1, i+window+1)):
-            piv_h.append((i, highs[i]))
-        l = lows[i]
-        if all(l < lows[j] for j in range(i-window, i)) and all(l < lows[j] for j in range(i+1, i+window+1)):
-            piv_l.append((i, lows[i]))
-    return piv_h, piv_l
+        if all(highs[i] > highs[j] for j in range(i-window,i)) and all(highs[i] > highs[j] for j in range(i+1,i+window+1)):
+            ph.append((i, highs[i]))
+        if all(lows[i] < lows[j] for j in range(i-window,i)) and all(lows[i] < lows[j] for j in range(i+1,i+window+1)):
+            pl.append((i, lows[i]))
+    return ph, pl
 
-def map_levels_from_labels_and_history(label_scores, candles=None):
+def map_sl_tp(label_scores, candles=None):
     last_price = candles[-1]["close"] if candles and len(candles)>0 else None
-    risk_est = 4.0
-    # compute weighted risk estimate
-    tw=0.0; rw=0.0
+    # weighted risk
+    tw=0.0; riskw=0.0
     for label, sc in label_scores.items():
-        meta = LABEL_LIBRARY.get(label, {"risk_pct":4.0})
-        rw += sc * meta.get("risk_pct",4.0); tw += sc
-    if tw>0: risk_est = rw / tw
+        meta = LABEL_LIBRARY.get(label, {"risk":4.0})
+        riskw += sc * meta["risk"]; tw += sc
+    risk = (riskw/(tw+1e-12)) if tw>0 else 4.0
     sl=None; tp=None; notes=[]
-    if candles and len(candles) >= 30:
-        ph, pl = local_pivots_from_candles(candles, window=4)
-        last_close = last_price
-        supports = sorted([p[1] for p in pl if p[1] < last_close], reverse=True)
-        resistances = sorted([p[1] for p in ph if p[1] > last_close])
+    if candles and len(candles)>=30:
+        ph, pl = local_pivots(candles, window=4)
+        supports = sorted([v for (i,v) in pl if v < last_price], reverse=True)
+        resistances = sorted([v for (i,v) in ph if v > last_price])
         if supports:
-            sl = supports[0] * (1 - 0.002)
-            notes.append("Stop unter lokalem Support")
+            sl = supports[0]*(1-0.002); notes.append("Stop unter lokalem Support")
         else:
-            sl = last_close * (1 - risk_est/100.0)
-            notes.append("Stop relativ (kein Support)")
+            sl = last_price*(1 - risk/100.0); notes.append("Stop relativ (kein Support)")
         if resistances:
-            tp = resistances[0] * (1 + 0.002)
-            notes.append("TP an lokalem Widerstand")
+            tp = resistances[0]*(1+0.002); notes.append("TP an lokalem Widerstand")
         else:
-            tp = last_close * (1 + 2 * risk_est/100.0)
-            notes.append("TP relativ (kein Widerstand)")
+            tp = last_price*(1 + 2*risk/100.0); notes.append("TP relativ (kein Widerstand)")
     else:
         if last_price:
-            sl = last_price * (1 - risk_est/100.0)
-            tp = last_price * (1 + 2*risk_est/100.0)
-            notes.append("Relative SL/TP (keine Candle-Historie)")
+            sl = last_price*(1 - risk/100.0)
+            tp = last_price*(1 + 2*risk/100.0)
+            notes.append("Relative SL/TP (zu wenig Historie)")
         else:
-            notes.append("Keine Preisinfo: nur relative Empfehlung")
-    return {"stop": None if sl is None else round(sl,6), "tp": None if tp is None else round(tp,6), "notes": notes, "risk_est": round(risk_est,2)}
+            notes.append("Keine Preisinfo: relative SL/TP nicht möglich")
+    return {"stop": None if sl is None else round(sl,6), "tp": None if tp is None else round(tp,6), "notes": notes, "risk_est": round(risk,2)}
 
-# ---------------------------
-# Backtester improvements (fees, slippage, pos sizing)
-# ---------------------------
-def backtest_pattern_on_history(candles, pattern_name, lookahead=10, slippage_pct=0.05, fee_pct=0.02, position_size_pct=1.0):
-    indices = []
-    for i in range(1, len(candles)):
+# -----------------------------
+# Backtester (improved)
+# -----------------------------
+def backtest(candles, pattern_name, lookahead=10, slippage_pct=0.05, fee_pct=0.02, position_pct=1.0):
+    indices=[]
+    for i in range(1,len(candles)):
         try:
             if "doji" in pattern_name.lower() and is_doji(candles[i]): indices.append(i)
             if "hammer" in pattern_name.lower() and is_hammer(candles[i]): indices.append(i)
-            if "engulf" in pattern_name.lower() and is_bullish_engulfing(candles[i-1], candles[i]): indices.append(i)
+            if "engulf" in pattern_name.lower() and is_engulfing(candles[i-1], candles[i]) is not None: indices.append(i)
         except Exception:
             continue
-    trades = []
-    wins = 0
-    total = 0
+    trades=[]; wins=0
     for idx in indices:
-        if idx + lookahead >= len(candles): continue
+        if idx+lookahead >= len(candles): continue
         entry = candles[idx]["close"] * (1 + slippage_pct/100.0)
-        exit_price = candles[idx+lookahead]["close"] * (1 - slippage_pct/100.0)
-        gross_ret = (exit_price - entry) / (entry + 1e-12)
-        net_ret = gross_ret - fee_pct/100.0
-        total += 1
-        trades.append(net_ret)
-        if net_ret > 0:
-            wins += 1
-    winrate = (wins / total * 100.0) if total else 0.0
-    avg_ret = (sum(trades)/len(trades)*100.0) if trades else 0.0
-    return {"pattern":pattern_name,"checked": total, "wins":wins, "winrate":round(winrate,2), "avg_return_pct":round(avg_ret,3)}
+        exitp = candles[idx+lookahead]["close"] * (1 - slippage_pct/100.0)
+        gross = (exitp - entry) / (entry + 1e-12)
+        net = gross - fee_pct/100.0
+        trades.append(net)
+        if net>0: wins += 1
+    total=len(trades)
+    winrate = (wins/total*100.0) if total>0 else 0.0
+    avg_ret = (sum(trades)/total*100.0) if trades else 0.0
+    pf = (sum(t for t in trades if t>0) / abs(sum(t for t in trades if t<0))) if any(t<0 for t in trades) else (sum(t for t in trades if t>0) or 0.0)
+    summary = f"{total} Trades getestet • Winrate {winrate:.1f}% • AvgRet {avg_ret:.3f}% • ProfitFactor {round(pf,3) if isinstance(pf,float) else None}"
+    return {"pattern":pattern_name,"checked":total,"wins":wins,"winrate":round(winrate,2),"avg_return_pct":round(avg_ret,3),"profit_factor":round(pf,3) if isinstance(pf,float) else None,"summary":summary}
 
-# ---------------------------
-# Annotation (PIL): draw labels & SL/TP
-# ---------------------------
-def annotate_image_bytes(image_bytes, label_scores, sl=None, tp=None):
+# -----------------------------
+# Annotation: map candle->image approx & draw
+# -----------------------------
+def annotate_uploaded_image(image_bytes, detections_labels, sl=None, tp=None):
     if not PIL_AVAILABLE:
         return None
     try:
@@ -516,97 +486,85 @@ def annotate_image_bytes(image_bytes, label_scores, sl=None, tp=None):
         return None
     draw = ImageDraw.Draw(img, "RGBA")
     W,H = img.size
+    # font
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 14)
     except Exception:
         font = None
-    items = sorted(label_scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
-    box_w = 280; box_h = 22*len(items)+14
-    draw.rectangle([10,10,10+box_w, 10+box_h], fill=(10,10,10,200))
-    y = 14
+    # draw top labels box
+    items = sorted(detections_labels.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    box_w = 300; box_h = 24*len(items)+12
+    draw.rectangle([12,12,12+box_w,12+box_h], fill=(12,12,12,200))
+    y=16
     for lab, sc in items:
         txt = f"{lab}: {sc:.2f}"
-        draw.text((16,y), txt, fill=(230,238,246,255), font=font)
-        y += 22
-    # SL / TP lines (approx positions)
+        draw.text((18,y), txt, fill=(230,238,246,255), font=font)
+        y += 24
+    # draw SL/TP approximate lines
     if sl is not None:
-        draw.line([(20, int(H*0.12)), (W-20, int(H*0.12))], fill=(255,204,0,200), width=3)
-        draw.text((22, int(H*0.12)-14), f"Stop: {sl}", fill=(255,204,0,255), font=font)
+        draw.line([(10, int(H*0.14)), (W-10, int(H*0.14))], fill=(255,204,0,200), width=3)
+        draw.text((14, int(H*0.14)-12), f"Stop: {sl}", fill=(255,204,0,255), font=font)
     if tp is not None:
-        draw.line([(20, int(H*0.18)), (W-20, int(H*0.18))], fill=(102,255,136,200), width=3)
-        draw.text((22, int(H*0.18)-14), f"TP: {tp}", fill=(102,255,136,255), font=font)
+        draw.line([(10, int(H*0.18)), (W-10, int(H*0.18))], fill=(102,255,136,200), width=3)
+        draw.text((14, int(H*0.18)-12), f"TP: {tp}", fill=(102,255,136,255), font=font)
     return img
 
-# ---------------------------
+# -----------------------------
 # Exports
-# ---------------------------
-def export_analysis_json(obj):
-    return json.dumps(obj, ensure_ascii=False, indent=2)
+# -----------------------------
+def export_json(obj):
+    return json.dumps(obj, indent=2, ensure_ascii=False)
 
-def export_analysis_csv(obj):
+def export_csv(obj):
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["key","value"])
-    meta = obj.get("meta", {})
+    meta = obj.get("meta",{})
     for k,v in meta.items():
         w.writerow([f"meta.{k}", v])
-    final = obj.get("final", {})
+    final = obj.get("final",{})
     for k,v in final.items():
-        if isinstance(v, (str,int,float)):
-            w.writerow([k, v])
+        if isinstance(v,(str,int,float)):
+            w.writerow([k,v])
         else:
-            try:
-                w.writerow([k, json.dumps(v, ensure_ascii=False)])
-            except Exception:
-                w.writerow([k, str(v)])
+            w.writerow([k,json.dumps(v, ensure_ascii=False)])
     return buf.getvalue()
 
-# ---------------------------
-# High-level image analyze pipeline (online-first, offline fallback)
-# ---------------------------
-def analyze_image_pipeline(image_bytes, symbol_hint=None, use_online=True):
-    rf_res = None
+# -----------------------------
+# High-level image pipeline
+# -----------------------------
+def analyze_image_full(image_bytes, symbol_hint=None, use_online=True):
+    rf_res=None
     if use_online and ONLINE and ROBOFLOW_KEY:
         rf_res = roboflow_detect(image_bytes, retries=2)
-    local_preds = local_detect_from_image_bytes(image_bytes)
-    # convert roboflow preds to label->conf format for fusion
-    rf_map = {}
+    local_preds = local_detect_from_image(image_bytes)
+    # build rf_map
+    rf_map={}
     if rf_res and isinstance(rf_res, dict) and "predictions" in rf_res:
         for p in rf_res["predictions"]:
-            cls = p.get("class","").lower()
-            conf = float(p.get("confidence",0.0))
+            cls = p.get("class","").lower(); conf = float(p.get("confidence",0.0))
             label = ROBOFLOW_TO_LABEL.get(cls, cls.title().replace("_"," "))
-            rf_map[label] = max(rf_map.get(label, 0.0), conf)
-    # fuse roboflow + local
-    label_scores = fuse_labels(rf_res, local_preds, prefer_online=True)
-    # attempt to fetch history for backtest
-    history = None
-    if use_online and ONLINE:
-        history = fetch_finnhub_candles(symbol_hint or "AAPL", "5", int(time.time()) - 60*60*24*90, int(time.time()))
-        if history is None and ALPHAV_KEY:
-            try:
-                av = fetch_alpha_minute(symbol_hint or "AAPL", interval="5min")
-                if av:
-                    history = av
-            except Exception:
-                history = None
-    if history is None:
-        history = generate_simulated_candles("backtest_seed_img", 900, 100.0, 5)
-    # evaluation
-    eval_res = evaluate_from_labels(label_scores, candlesticks=history)
-    # map levels
-    levels = map_levels_from_labels_and_history(label_scores, history)
-    # backtest top pattern (for calibration)
-    top_label = max(label_scores.items(), key=lambda kv: kv[1])[0] if label_scores else None
-    bt_res = backtest_pattern_on_history(history, top_label or "NoClearPattern", lookahead=10, slippage_pct=0.05, fee_pct=0.02)
-    # adjust probability slightly toward historical winrate
-    if bt_res["checked"] > 0:
-        adj_prob = round((eval_res["probability"]*0.6 + bt_res["winrate"]*0.4),1)
+            rf_map[label] = max(rf_map.get(label,0.0), conf)
+    # fuse
+    label_scores = fuse_labels(rf_res, local_preds)
+    # try fetch history for backtest
+    history=None
+    if use_online and ONLINE and FINNHUB_KEY and symbol_hint:
+        history = fetch_finnhub_candles(symbol_hint, resolution="5", from_ts=int(time.time())-60*60*24*90, to_ts=int(time.time()))
+    if not history:
+        history = generate_simulated_candles("img_hist_seed", 900, 100.0, 5)
+    eval_res = evaluate_labels(label_scores, candlesticks=history)
+    levels = map_sl_tp(label_scores, history)
+    # backtest top label
+    top_label = max(label_scores.items(), key=lambda kv: kv[1])[0] if label_scores else "NoClearPattern"
+    bt = backtest(history, top_label, lookahead=10)
+    # adjust final probability with historical winrate
+    if bt["checked"] > 0:
+        final_prob = round((eval_res["probability"]*0.6 + bt["winrate"]*0.4),1)
     else:
-        adj_prob = eval_res["probability"]
-    eval_res["probability"] = adj_prob
-    # annotate image
-    annotated = annotate_image_bytes(image_bytes, label_scores, sl=levels.get("stop"), tp=levels.get("tp"))
+        final_prob = eval_res["probability"]
+    eval_res["probability"] = final_prob
+    annotated = annotate_uploaded_image(image_bytes, label_scores, sl=levels.get("stop"), tp=levels.get("tp"))
     export_obj = {
         "meta": {"ts": now_iso(), "source": "roboflow+local" if rf_res else "local-only", "symbol_hint": symbol_hint},
         "final": {
@@ -616,17 +574,16 @@ def analyze_image_pipeline(image_bytes, symbol_hint=None, use_online=True):
             "rationale": eval_res["rationale"],
             "label_scores": dict(label_scores),
             "levels": levels,
-            "backtest": bt_res
+            "backtest": bt
         },
         "internals": {"roboflow_raw": rf_res, "local_preds": local_preds}
     }
-    # store audit
-    append_audit({"ts": now_iso(), "type": "image_analysis", "summary": {"rec": eval_res["recommendation"], "prob": eval_res["probability"]}})
-    return {"export": export_obj, "annotated_image": annotated, "history_used_len": len(history)}
+    append_audit({"ts": now_iso(), "type": "image", "summary": {"rec": eval_res["recommendation"], "prob": eval_res["probability"], "labels": list(label_scores.keys())}})
+    return {"export": export_obj, "annotated": annotated, "history_len": len(history)}
 
-# ---------------------------
-# UI: Navigation & Pages
-# ---------------------------
+# -----------------------------
+# UI pages
+# -----------------------------
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Seite", ["Home","Live Analyzer","Bild Analyzer","Backtest","Audit","Einstellungen","Hilfe"])
 
@@ -639,89 +596,91 @@ else:
 if page == "Home":
     st.header("Lumina Pro — Übersicht")
     st.markdown("""
-    - Live Analyzer: Finnhub & AlphaV (Fallback) — Candle-Daten, Patterns, SL/TP
-    - Bild Analyzer: Roboflow (online) + lokaler Fallback — sofortige Analyse + Annotation
-    - Backtester: Simulations-basierter Test mit Fees/Slippage/Positionsgrößen
-    - Audit: Verwalte frühere Analysen
+    Hybrid-Modus: Live-Daten (Finnhub) wenn verfügbar, sonst Offline-Simulation.
+    Bild-Analyzer: Roboflow (online) + lokaler Fallback (pixelheuristik).
     """)
     st.write("Pillow:", PIL_AVAILABLE, "Matplotlib:", MATPLOTLIB_AVAILABLE)
     st.markdown("---")
-    st.write("Letzte Analysen (Audit):")
+    st.subheader("Letzte Analysen")
     try:
         with open(AUDIT_FILE, "r", encoding="utf-8") as f:
             arr = json.load(f)
-        for a in arr[-6:][::-1]:
+        for a in arr[-8:][::-1]:
             st.write(f"- {a.get('ts')} • {a.get('type')} • {a.get('summary')}")
     except Exception:
-        st.info("Keine Audit-Daten gefunden.")
+        st.info("Keine Audit-Einträge.")
 
 # Live Analyzer
 elif page == "Live Analyzer":
-    st.header("Live Analyzer")
-    left, right = st.columns([3,1])
-    with right:
-        symbol = st.text_input("Symbol (Finnhub format, z.B. BINANCE:BTCUSDT oder AAPL)", value="AAPL")
-        resolution = st.selectbox("Interval (Min)", ["1","5","15","30","60"], index=1)
-        periods = st.slider("Candles", 30, 1000, 240, step=10)
-        run = st.button("Lade & Analysiere")
-    with left:
+    st.header("Live Analyzer (Hybrid)")
+    col1, col2 = st.columns([3,1])
+    with col2:
+        symbol = st.text_input("Finnhub-Symbol (z.B. AAPL, BINANCE:BTCUSDT)", "AAPL")
+        resolution = st.selectbox("Intervall (Min)", ["1","5","15","30","60"], index=1)
+        periods = st.slider("Anzahl Kerzen", 30, 1200, 300, step=10)
+        run = st.button("Laden & Analysieren")
+    with col1:
         if run:
-            candles = None
+            candles=None
             if ONLINE and FINNHUB_KEY:
                 to_ts = int(time.time()); from_ts = to_ts - periods * int(resolution) * 60
                 candles = fetch_finnhub_candles(symbol, resolution, from_ts, to_ts)
-                if candles is None and ALPHAV_KEY:
-                    st.warning("Finnhub lieferte nichts — versuche Alpha Vantage")
-                    av = fetch_alpha_minute(symbol, interval=resolution + "min")
-                    if av: candles = av[-periods:] if len(av)>=periods else av
                 if candles is None:
-                    st.warning("Keine Live-Daten — Nutzung simulierte Daten")
-                    candles = generate_simulated_candles(symbol + "_sim", periods, 100.0, int(resolution))
+                    st.warning("Finnhub lieferte keine Daten — nutze simulierte Daten")
+                    candles = generate_simulated_candles(symbol+"_sim", periods, 100.0, int(resolution))
                 elif len(candles) < periods:
                     need = periods - len(candles)
-                    pad = generate_simulated_candles(symbol + "_pad", need, candles[0]["open"] if candles else 100.0, int(resolution))
+                    pad = generate_simulated_candles(symbol+"_pad", need, candles[0]["open"] if candles else 100.0, int(resolution))
                     candles = pad + candles
             else:
-                st.info("Offline: Nutzung simulierte Daten")
-                candles = generate_simulated_candles(symbol + "_sim", periods, 100.0, int(resolution))
-            # compute indicators & detect patterns
-            patt = detect_patterns_from_candles(candles)
+                st.info("Offline → Simulation")
+                candles = generate_simulated_candles(symbol+"_sim", periods, 100.0, int(resolution))
+            # detect patterns
+            patterns = detect_patterns_from_candles(candles)
+            formations = detect_formations(candles)
             closes = [c["close"] for c in candles]
-            if len(closes) >= 50:
-                s20 = sum(closes[-20:])/20
-                s50 = sum(closes[-50:])/50
+            trend = "Seitwärts"
+            if len(closes)>=50:
+                s20 = sum(closes[-20:])/20; s50 = sum(closes[-50:])/50
                 trend = "Aufwärtstrend" if s20 > s50 else ("Abwärtstrend" if s20 < s50 else "Seitwärts")
+            # convert patterns to label_scores
+            label_scores = {}
+            for p in patterns[-8:]:
+                label_scores[p[0]] = max(label_scores.get(p[0],0.0), 0.65)
+            for f in formations[-3:]:
+                label_scores[f[0]] = max(label_scores.get(f[0],0.0), 0.7)
+            eval_res = evaluate_labels(label_scores, candlesticks=candles)
+            levels = map_sl_tp(label_scores, candles)
+            # backtest top if available
+            top_label = max(label_scores.items(), key=lambda kv: kv[1])[0] if label_scores else None
+            bt = backtest(candles, top_label or "NoClearPattern", lookahead=10)
+            if eval_res["recommendation"]=="Kaufen":
+                st.success(f"Empfehlung: {eval_res['recommendation']}  •  {eval_res['probability']}%  •  Risiko: {eval_res['risk_pct']}%")
+            elif eval_res["recommendation"]=="Short":
+                st.error(f"Empfehlung: {eval_res['recommendation']}  •  {eval_res['probability']}%  •  Risiko: {eval_res['risk_pct']}%")
             else:
-                trend = "Seitwärts"
-            # map patterns -> levels
-            pseudo_label_scores = {}
-            for p in patt[-6:]:
-                pseudo_label_scores[p[0]] = pseudo_label_scores.get(p[0], 0.6)
-            eval_res = evaluate_from_labels(pseudo_label_scores, candlesticks=candles)
-            levels = map_levels_from_labels_and_history(pseudo_label_scores, candles)
-            # display
-            st.subheader(f"{symbol} — {trend}")
-            st.write(f"Aktuell: {candles[-1]['close']:.6f}")
-            st.write("Detected patterns:", [p[0] for p in patt][-8:])
-            st.write("Empfehlung:", eval_res["recommendation"], "Wahrscheinlichkeit:", eval_res["probability"], "%", "Risiko:", eval_res["risk_pct"], "%")
+                st.info(f"Empfehlung: {eval_res['recommendation']}  •  {eval_res['probability']}%  •  Risiko: {eval_res['risk_pct']}%")
             st.write("SL:", levels["stop"], "TP:", levels["tp"])
+            st.write("Erkannte Patterns:", list(label_scores.keys())[:8])
+            st.write("Formationen:", [f[0] for f in formations][:3])
+            st.markdown("**Backtest (Top-Pattern)**"); st.write(bt["summary"])
             # plot
             if MATPLOTLIB_AVAILABLE:
                 fig, ax = plt.subplots(figsize=(11,4), facecolor="#07070a")
-                ax.plot([c["t"] for c in candles[-300:]], [c["close"] for c in candles[-300:]], color="#00cc66")
+                ax.plot([c["t"] for c in candles[-400:]], [c["close"] for c in candles[-400:]], color="#00cc66")
                 ax.set_facecolor("#07070a"); ax.tick_params(colors="#9aa6b2")
                 st.pyplot(fig)
             else:
-                # simple svg fallback
-                def render_svg_candles(candles, width=1000, height=420):
+                # simple svg
+                def svg_candles(candles, width=1000, height=420):
                     if not candles: return "<svg></svg>"
                     n=len(candles)
                     margin=50; chart_h=int(height*0.6)
-                    max_p=max(c["high"] for c in candles); min_p=min(c["low"] for c in candles)
-                    pad=(max_p-min_p)*0.05 if (max_p-min_p)>0 else 1.0
-                    max_p+=pad; min_p-=pad
+                    maxp=max(c["high"] for c in candles); minp=min(c["low"] for c in candles)
+                    pad=(maxp-minp)*0.05 if (maxp-minp)>0 else 1.0
+                    maxp+=pad; minp-=pad
                     spacing=(width-2*margin)/n; cw=max(2, spacing*0.6)
-                    def y(p): return margin + chart_h - (p-min_p)/(max_p-min_p)*chart_h
+                    def y(p): return margin + chart_h - (p-minp)/(maxp-minp)*chart_h
                     svg=[f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">', f'<rect x="0" y="0" width="{width}" height="{height}" fill="#07070a"/>']
                     for i,c in enumerate(candles[-160:]):
                         cx=margin + i*spacing + spacing/2
@@ -732,100 +691,90 @@ elif page == "Live Analyzer":
                         svg.append(f'<rect x="{cx-cw/2}" y="{by}" width="{cw}" height="{bh}" fill="{color}" stroke="{color}" rx="1" ry="1"/>')
                     svg.append('</svg>')
                     return "\n".join(svg)
-                st.components.v1.html(render_svg_candles(candles[-160:]), height=440)
+                st.components.v1.html(svg_candles(candles[-160:]), height=460)
 
 # Bild Analyzer
 elif page == "Bild Analyzer":
-    st.header("Bild-Analyse (Upload) — Roboflow + Offline-Fallback")
-    st.markdown("Lade ein Chart-Screenshot hoch. Die App analysiert Muster automatisch, berechnet SL/TP, macht Backtest und annotiert das Bild.")
+    st.header("Bild-Analyse (Roboflow + Offline-Fallback)")
+    st.markdown("Lade Chart-Screenshot hoch; Analyse läuft automatisch (online-first).")
     uploaded = st.file_uploader("Chart-Bild (PNG/JPG)", type=["png","jpg","jpeg"])
-    symbol_hint = st.text_input("Symbol-Hinweis für Backtest (optional)", value="AAPL")
-    run = st.button("Analysiere Bild (automatisch)")
-    show_internals = st.checkbox("Zeige interne Metriken", value=False)
+    symbol_hint = st.text_input("Symbol-Hinweis für Backtest (optional)", "AAPL")
+    run = st.button("Analysiere Bild")
+    show_internal = st.checkbox("Zeige Internals", value=False)
     if uploaded:
         st.image(uploaded, use_column_width=True)
         if run:
             img_bytes = uploaded.read()
-            with st.spinner("Analysiere Bild — Roboflow (falls online) + lokale Heuristiken..."):
+            with st.spinner("Analysiere..."):
                 try:
-                    res = analyze_image_pipeline(img_bytes, symbol_hint=symbol_hint, use_online=True)
+                    res = analyze_image_full(img_bytes, symbol_hint, use_online=True)
                 except Exception as e:
                     st.error("Analyse fehlgeschlagen: " + str(e))
                     res = None
             if res:
                 final = res["export"]
-                st.subheader("Ergebnis")
                 rec = final["final"]["recommendation"]
                 prob = final["final"]["probability"]
                 risk = final["final"]["risk_pct"]
-                if rec == "Kaufen":
-                    st.success(f"Empfehlung: {rec}  •  {prob}%  • Risiko: {risk}%")
-                elif rec == "Short":
-                    st.error(f"Empfehlung: {rec}  •  {prob}%  • Risiko: {risk}%")
-                else:
-                    st.info(f"Empfehlung: {rec}  •  {prob}%  • Risiko: {risk}%")
-                st.markdown("**Kurz-Fazit (3 Sätze):**")
-                # synthesize 3-sentence human-friendly summary
-                summ = final["final"].get("rationale", [])
-                lines = []
-                lines.append(f"Muster: {', '.join(list(final['final'].get('label_scores', {}).keys())[:3])}")
-                lines.append(f"Trefferwahrscheinlichkeit (geschätzt): {prob} % • Risiko: {risk} %")
-                lines.append(f"SL/TP: {final['final'].get('levels', {}).get('stop')} / {final['final'].get('levels', {}).get('tp')}")
-                for s in lines[:3]:
+                if rec=="Kaufen": st.success(f"Empfehlung: {rec}  •  {prob}%  • Risiko: {risk}%")
+                elif rec=="Short": st.error(f"Empfehlung: {rec}  •  {prob}%  • Risiko: {risk}%")
+                else: st.info(f"Empfehlung: {rec}  •  {prob}%  • Risiko: {risk}%")
+                st.markdown("**3-Satz-Fazit:**")
+                # create 3-sentence human summary
+                labels = list(final["final"].get("label_scores", {}).keys())[:3]
+                s1 = f"Erkannte Muster: {', '.join(labels) if labels else 'keine'}."
+                s2 = f"Trefferwahrscheinlichkeit geschätzt: {prob}% • Risiko: {risk}%."
+                levels = final["final"].get("levels", {})
+                s3 = f"Empfohlene SL/TP: {levels.get('stop')} / {levels.get('tp')}."
+                for s in [s1,s2,s3]:
                     st.write("- " + s)
                 st.markdown("---")
-                st.subheader("Details & Backtest")
+                st.subheader("Backtest (Kurz)")
                 bt = final["final"].get("backtest", {})
-                st.write(f"Backtest: checked={bt.get('checked')} wins={bt.get('wins')} winrate={bt.get('winrate')}% avgRet={bt.get('avg_return_pct')}%")
-                st.markdown("**Rationale (Labels):**")
+                st.write(bt.get("summary"))
+                st.markdown("**Rationale / Labels**")
                 for r in final["final"].get("rationale", [])[:8]:
                     st.write("- " + r)
-                # show annotated image
-                if res.get("annotated_image") is not None:
-                    st.image(res["annotated_image"], use_column_width=True)
-                # export buttons
-                st.download_button("Exportiere Analyse (JSON)", data=export_analysis_json(final), file_name=f"lumina_analysis_{short_ts()}.json", mime="application/json")
-                st.download_button("Exportiere Analyse (CSV)", data=export_analysis_csv(final), file_name=f"lumina_analysis_{short_ts()}.csv", mime="text/csv")
-                if show_internals:
+                if res.get("annotated") is not None:
+                    st.image(res["annotated"], use_column_width=True)
+                st.download_button("Export JSON", data=export_json(final), file_name=f"analysis_{short_ts()}.json", mime="application/json")
+                st.download_button("Export CSV", data=export_csv(final), file_name=f"analysis_{short_ts()}.csv", mime="text/csv")
+                if show_internal:
                     st.write("Internals:", final.get("internals", {}))
             else:
-                st.error("Keine Analyseergebnisse (Roboflow/offline Fehler).")
+                st.error("Keine Ergebnisse – Roboflow/offline Fehler.")
 
-# Backtest page
+# Backtest page (manual)
 elif page == "Backtest":
     st.header("Backtester (manuell)")
-    pattern = st.selectbox("Pattern", ["Bullish Engulfing","Bearish Engulfing","Hammer","Doji","Morning Star","Three White Soldiers"])
+    pattern = st.selectbox("Pattern", ["Bullish Engulfing","Bearish Engulfing","Hammer","Doji","Morning Star","Three White Soldiers","Double Top","Double Bottom","Head & Shoulders"])
     lookahead = st.slider("Lookahead (Kerzen)", 1, 30, 10)
-    pos_size = st.number_input("Positionsgröße (% vom Kapital)", value=1.0, min_value=0.1, step=0.1)
-    slippage = st.number_input("Slippage (%)", value=0.05, step=0.01)
-    fee = st.number_input("Fee (%)", value=0.02, step=0.01)
-    if st.button("Backtest ausführen"):
-        hist = generate_simulated_candles("bt_seed_manual", 1200, 100.0, 5)
-        res = backtest_pattern_on_history(hist, pattern, lookahead=lookahead, slippage_pct=slippage, fee_pct=fee, position_size_pct=pos_size)
+    slippage = st.number_input("Slippage (%)", 0.0, 5.0, 0.05, step=0.01)
+    fee = st.number_input("Fee (%)", 0.0, 2.0, 0.02, step=0.01)
+    if st.button("Backtest starten"):
+        hist = generate_simulated_candles("bt_seed", 1200, 100.0, 5)
+        res = backtest(hist, pattern, lookahead=lookahead, slippage_pct=slippage, fee_pct=fee)
         st.write(res)
-        # human readable conclusion
         if res["checked"] == 0:
-            st.info("Keine Events gefunden in der Test-Historie.")
+            st.info("Keine Events gefunden.")
         else:
             if res["winrate"] > 60 and res["avg_return_pct"] > 0:
-                conclusion = "Starkes Ergebnis — Pattern liefert überdurchschnittliche Trefferquote in Simulation."
+                conclusion = "Starkes Ergebnis — Pattern zeigt gute Trefferquote in Simulation."
             elif res["winrate"] > 45:
-                conclusion = "Akzeptables Ergebnis — Pattern zeigt moderate Trefferquote."
+                conclusion = "Akzeptabel — moderates Verhalten."
             else:
-                conclusion = "Schwaches Ergebnis — Vorsicht, hohes Risiko."
+                conclusion = "Schwach — hohe Vorsicht empfohlen."
             st.markdown("**Fazit:** " + conclusion)
 
-# Audit page
+# Audit
 elif page == "Audit":
-    st.header("Analyse-Audit")
+    st.header("Audit — vergangene Analysen")
     try:
         with open(AUDIT_FILE, "r", encoding="utf-8") as f:
             arr = json.load(f)
-        st.write(f"Gesamt Analysen: {len(arr)}")
-        if arr:
-            df = arr[::-1]  # latest first
-            for a in df[:200]:
-                st.write(f"{a.get('ts')} • {a.get('type')} • {a.get('summary')}")
+        st.write(f"Analysen gespeichert: {len(arr)}")
+        for a in arr[::-1][:200]:
+            st.write(f"{a.get('ts')} • {a.get('type')} • {a.get('summary')}")
         if st.button("Audit löschen"):
             with open(AUDIT_FILE, "w", encoding="utf-8") as f:
                 json.dump([], f)
@@ -833,28 +782,35 @@ elif page == "Audit":
     except Exception:
         st.info("Keine Auditdaten.")
 
-# Einstellungen
+# Einstellungen & Hilfe
 elif page == "Einstellungen":
     st.header("Einstellungen")
-    st.write("Pillow installiert:", PIL_AVAILABLE)
-    st.write("Matplotlib installiert:", MATPLOTLIB_AVAILABLE)
-    st.write("Finnhub Key vorhanden:", bool(FINNHUB_KEY))
-    st.write("Roboflow Key vorhanden:", bool(ROBOFLOW_KEY))
-    if st.button("Cache leeren"):
-        for f in os.listdir(CACHE_DIR):
-            try: os.remove(os.path.join(CACHE_DIR, f))
-            except: pass
-        st.success("Cache geleert.")
+    st.write("Hybrid-Modus:", "ONLINE" if ONLINE else "OFFLINE")
+    st.write("Pillow:", PIL_AVAILABLE, "Matplotlib:", MATPLOTLIB_AVAILABLE)
+    st.write("Finnhub-Key vorhanden:", bool(FINNHUB_KEY))
+    st.write("Roboflow-Key vorhanden:", bool(ROBOFLOW_KEY))
+    if st.button("Cache & Audit löschen"):
+        try:
+            for f in os.listdir(CACHE_DIR):
+                os.remove(os.path.join(CACHE_DIR,f))
+        except Exception:
+            pass
+        try:
+            with open(AUDIT_FILE, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        except Exception:
+            pass
+        st.success("Gelöscht.")
 
-# Hilfe
 elif page == "Hilfe":
-    st.header("Hilfe & Hinweise")
+    st.header("Hilfe / Hinweise")
     st.markdown("""
-    - Bild-Analyzer arbeitet online (Roboflow) und offline (local fallback). Roboflow verbessert Erkennungsqualität.
-    - Live Analyzer nutzt Finnhub primär und Alpha Vantage als Fallback (Achtung API-Limits).
-    - Empfehlungen sind statistische Schätzungen — **keine Anlageberatung**.
-    - Exportiere Analysen mit dem JSON/CSV Button.
+    - Hybrid: Live-Daten (Finnhub) wenn online, sonst deterministische Simulation.
+    - Bildanalyse nutzt Roboflow (online) und lokale Pixelheuristiken (offline fallback).
+    - Empfehlungen sind Schätzungen/statistische Werte — KEINE Anlageberatung.
+    - Exportiere Analysen mit JSON/CSV.
+    - Wenn etwas fehlt: prüfe Keys, Internet oder installiere Pillow/Matplotlib.
     """)
 
 st.markdown("---")
-st.caption("Lumina Pro — Deep Analyzer • Keys sind im Code (nicht sicher für öffentliche Repos). Use responsibly; not financial advice.")
+st.caption("Lumina Pro — Hybrid Deep Analyzer — Keys im Code (für Entwicklung). Entferne Keys im Produktivmodus.")

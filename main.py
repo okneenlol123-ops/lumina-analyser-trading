@@ -1,545 +1,572 @@
 # main.py
-# Lumina Pro — Aggressive Image Analyzer (Roboflow + Local fallback + Finnhub backtest)
-# Fokus: Bildanalyse (wenig Neutral), klare Empfehlung (Kaufen/Short/Neutral only if truly unknown)
-#
-# Requirements:
-# pip install streamlit pillow
-#
-# Keys: set your keys here or move to st.secrets for production
-ROBOFLOW_KEY = "rf_54FHs4sk2XhtAQly4YNOSTjo75B2"   # <--- set or "" to disable
-ROBOFLOW_MODEL_PATH = "chart-pattern-detector/1"   # model path on Roboflow
-FINNHUB_KEY = "d49pi19r01qlaebikhvgd49pi19r01qlaebiki00"  # <--- set or "" to disable
+# Lumina Pro — Advanced Aggressive Image Analyzer (offline-capable)
+# Uses Pillow + pure Python (no OpenCV / no numpy / no sklearn)
+# Requirements: pip install streamlit pillow
 
 import streamlit as st
-import io, os, time, json, random, urllib.request, urllib.parse, csv
-from datetime import datetime, timedelta
+from PIL import Image, ImageOps, ImageFilter, ImageDraw, ImageFont
+import io, os, json, math, statistics, time
+from datetime import datetime
 
-# Pillow
-try:
-    from PIL import Image, ImageOps, ImageFilter, ImageDraw, ImageFont
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
+# -------------------------
+# Config / UI styling
+# -------------------------
+st.set_page_config(page_title="Lumina Pro — Image Analyzer (Aggressive)", layout="centered")
+st.markdown("""
+<style>
+html, body, [class*="css"] { background:#000 !important; color:#e6eef6 !important; }
+.stButton>button { background:#111 !important; color:#e6eef6 !important; border:1px solid #222 !important; }
+.card { background:#070707; padding:12px; border-radius:8px; border:1px solid #111; margin-bottom:12px; }
+.small { color:#9aa6b2; font-size:13px; }
+</style>
+""", unsafe_allow_html=True)
 
-# Basic utils
-def now_iso(): return datetime.utcnow().isoformat() + "Z"
-def short_ts(): return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+st.title("Lumina Pro — Aggressive Bild-Analyzer (Candle Geometry + Regression + Voting)")
 
-def internet_ok(timeout=2):
-    try:
-        urllib.request.urlopen("https://www.google.com", timeout=timeout)
-        return True
-    except Exception:
-        return False
-
-ONLINE = internet_ok()
-
-# Audit file
-AUDIT_FILE = "image_analysis_audit.json"
+# -------------------------
+# Audit / persistence
+# -------------------------
+AUDIT_FILE = "image_analyzer_audit.json"
 if not os.path.exists(AUDIT_FILE):
     with open(AUDIT_FILE, "w", encoding="utf-8") as f:
         json.dump([], f)
 
-def append_audit(obj):
+def append_audit(entry):
     try:
-        arr = json.load(open(AUDIT_FILE, "r", encoding="utf-8"))
-    except Exception:
-        arr = []
-    arr.append(obj)
-    try:
-        json.dump(arr, open(AUDIT_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+        a = []
+        if os.path.exists(AUDIT_FILE):
+            with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+                a = json.load(f)
+        a.append(entry)
+        with open(AUDIT_FILE, "w", encoding="utf-8") as f:
+            json.dump(a, f, indent=2, ensure_ascii=False)
     except Exception:
         pass
 
-# Roboflow multipart
-def encode_multipart(fieldname, filename, file_bytes, content_type="image/png"):
-    boundary = "----WebKitFormBoundary" + "".join(random.choice("0123456789abcdef") for _ in range(16))
-    crlf = b"\r\n"
-    body = bytearray()
-    body.extend(b"--" + boundary.encode() + crlf)
-    body.extend(f'Content-Disposition: form-data; name="{fieldname}"; filename="{filename}"'.encode() + crlf)
-    body.extend(f"Content-Type: {content_type}".encode() + crlf + crlf)
-    body.extend(file_bytes + crlf)
-    body.extend(b"--" + boundary.encode() + b"--" + crlf)
-    return f"multipart/form-data; boundary={boundary}", bytes(body)
+def now_iso(): return datetime.utcnow().isoformat() + "Z"
+def short_ts(): return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-def roboflow_detect(image_bytes, retries=2, timeout=20):
-    if not ROBOFLOW_KEY:
-        return None
-    endpoint = f"https://detect.roboflow.com/{ROBOFLOW_MODEL_PATH}?api_key={urllib.parse.quote(ROBOFLOW_KEY)}"
-    for attempt in range(retries+1):
-        try:
-            ct, body = encode_multipart("file", "upload.png", image_bytes, "image/png")
-            req = urllib.request.Request(endpoint, data=body, method="POST")
-            req.add_header("Content-Type", ct)
-            req.add_header("User-Agent", "LuminaPro-ImageAnalyzer/1.0")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw)
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(1 + attempt)
-                continue
-            return None
-
-# Label mapping + base heuristics
-LABEL_LIBRARY = {
-    "Bullish Engulfing": {"dir":"bull", "base_wr":0.70, "risk":2.5},
-    "Bearish Engulfing": {"dir":"bear", "base_wr":0.68, "risk":2.5},
-    "Hammer": {"dir":"bull", "base_wr":0.63, "risk":2.8},
-    "Shooting Star": {"dir":"bear", "base_wr":0.62, "risk":3.0},
-    "Doji": {"dir":"neutral", "base_wr":0.48, "risk":4.0},
-    "Morning Star": {"dir":"bull", "base_wr":0.75, "risk":2.0},
-    "Evening Star": {"dir":"bear", "base_wr":0.74, "risk":2.0},
-    "Three White Soldiers": {"dir":"bull", "base_wr":0.78, "risk":2.0},
-    "Three Black Crows": {"dir":"bear", "base_wr":0.77, "risk":2.0},
-    "Double Top": {"dir":"bear", "base_wr":0.66, "risk":3.5},
-    "Double Bottom": {"dir":"bull", "base_wr":0.66, "risk":3.2},
-    "Head & Shoulders": {"dir":"bear", "base_wr":0.68, "risk":3.5},
-    "NoClearPattern": {"dir":"neutral", "base_wr":0.45, "risk":5.0},
-    "ChoppyMarket": {"dir":"neutral", "base_wr":0.40, "risk":5.5},
-}
-
-ROBOFLOW_TO_LABEL = {
-    "bullish_engulfing":"Bullish Engulfing",
-    "bearish_engulfing":"Bearish Engulfing",
-    "hammer":"Hammer",
-    "shooting_star":"Shooting Star",
-    "doji":"Doji",
-    "morning_star":"Morning Star",
-    "evening_star":"Evening Star",
-    "three_white_soldiers":"Three White Soldiers",
-    "three_black_crows":"Three Black Crows",
-    "double_top":"Double Top",
-    "double_bottom":"Double Bottom",
-    "head_shoulders":"Head & Shoulders",
-}
-
-# Local pixel-based detection (aggressive heuristics)
-def local_detect_from_image_bytes(image_bytes):
-    """Return list of (label, score)"""
-    if not PIL_AVAILABLE:
-        return []
+# -------------------------
+# Helpers: image preprocessing
+# -------------------------
+def load_image_bytes(bytes_in):
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        img = Image.open(io.BytesIO(bytes_in)).convert("RGB")
+        return img
     except Exception:
-        return []
-    W,H = img.size
-    # crop central chart area heuristics
-    left = int(W*0.04); right = int(W*0.96); top = int(H*0.08); bottom = int(H*0.82)
-    crop = img.crop((left, top, right, bottom))
-    crop = ImageOps.autocontrast(crop, cutoff=2)
-    crop = crop.filter(ImageFilter.MedianFilter(size=3))
-    pix = crop.load()
-    Wc,Hc = crop.size
-    # column darkness profile
-    col_sum = []
-    for x in range(Wc):
+        return None
+
+def preprocess_image_for_chart(img: Image.Image):
+    """
+    - Convert to grayscale
+    - Autocontrast
+    - Median filter to reduce noise
+    - Return processed grayscale image
+    """
+    gray = img.convert("L")
+    gray = ImageOps.autocontrast(gray, cutoff=2)
+    gray = gray.filter(ImageFilter.MedianFilter(size=3))
+    return gray
+
+# -------------------------
+# Candle geometry extraction
+# -------------------------
+def extract_candles_from_grayscale_image(gray_img, expected_min_candles=8):
+    """
+    Heuristics:
+    - Crop central area of image (remove UI/top/bottom)
+    - Scan columns (step) and find dark pixel clusters indicating wicks/bodies
+    - For each detected cluster produce wick_top, wick_bottom, body_top, body_bottom, color_guess
+    Returns list of candle dicts (left-to-right)
+    """
+
+    W, H = gray_img.size
+    # crop central area heuristics (tweakable)
+    left = int(W * 0.03)
+    right = int(W * 0.97)
+    top = int(H * 0.08)
+    bottom = int(H * 0.82)
+    chart = gray_img.crop((left, top, right, bottom))
+    Wc, Hc = chart.size
+    pixels = chart.load()
+
+    # column step roughly: 1 or more depending on width
+    # choose small step to get many columns, but cluster later
+    step = max(1, Wc // 300)  # aim ~300 columns max
+    col_profiles = []
+    for x in range(0, Wc, step):
+        # compute darkness metric per column (sum of inverted pixel)
         s = 0
-        for y in range(0, Hc, 2):
-            s += 255 - pix[x,y]
-        col_sum.append(s)
-    maxv = max(col_sum) if col_sum else 1
-    norm = [v / maxv for v in col_sum]
-    peaks = [i for i in range(2, Wc-2) if norm[i] > norm[i-1] and norm[i] > norm[i+1] and norm[i] > 0.5]
-    # count long lower/upper wicks by sampling vertical darkness around peaks
-    hammer_count = 0; shooting_count = 0; doji_count = 0
-    for x in peaks:
-        col = [255 - pix[x,y] for y in range(Hc)]
-        if not col: continue
-        maxc = max(col); threshold = max(2, maxc*0.45)
-        strong = [i for i,v in enumerate(col) if v>=threshold]
-        if not strong: continue
-        body_top = min(strong); body_bot = max(strong)
-        body = body_bot - body_top + 1
-        top_gap = body_top
-        bot_gap = Hc - 1 - body_bot
-        # doji: tiny body
-        if body < max(1, Hc*0.06):
-            doji_count += 1
-        # hammer: long lower shadow
-        if bot_gap > 2.5*body and body > 0:
-            hammer_count += 1
-        # shooting: long upper shadow
-        if top_gap > 2.5*body and body > 0:
-            shooting_count += 1
-    results = []
-    # produce scores aggressively: 1-2 events -> high confidence
-    if hammer_count > 0:
-        s = min(0.95, 0.45 + hammer_count*0.18)
-        results.append(("Hammer", round(s,2)))
-    if shooting_count > 0:
-        s = min(0.95, 0.42 + shooting_count*0.16)
-        results.append(("Shooting Star", round(s,2)))
-    if doji_count > 0:
-        s = min(0.9, 0.30 + doji_count*0.08)
-        results.append(("Doji", round(s,2)))
-    density = len(peaks) / (Wc/100.0 + 1e-9)
-    if density > 6:
-        results.append(("ChoppyMarket", round(min(0.95, density/12.0 + 0.2),2)))
-    if not results:
-        # fallback structural hint (detect if many peaks consistent => trending)
-        avg = sum(norm)/len(norm) if norm else 0.0
-        if avg > 0.22:
-            results.append(("Three White Soldiers", 0.55))
+        dark_positions = []
+        for y in range(Hc):
+            val = pixels[x, y]  # 0 black .. 255 white
+            inv = 255 - val
+            if inv > 8:  # ignore tiny noise (threshold)
+                s += inv
+                dark_positions.append(y)
+        col_profiles.append({"x": x, "sum": s, "dark_pos": dark_positions})
+
+    # find columns that likely contain candles by thresholding sum
+    if not col_profiles:
+        return []
+
+    max_sum = max(c["sum"] for c in col_profiles) or 1
+    # threshold quite permissive (aggressive)
+    threshold = max(10, max_sum * 0.12)
+    candidate_cols = [c for c in col_profiles if c["sum"] >= threshold]
+
+    # cluster adjacent columns into candle groups
+    candles = []
+    i = 0
+    while i < len(candidate_cols):
+        group = [candidate_cols[i]]
+        j = i + 1
+        while j < len(candidate_cols) and candidate_cols[j]["x"] - candidate_cols[j-1]["x"] <= step * 2:
+            group.append(candidate_cols[j]); j += 1
+        # aggregate group into single candle
+        all_dark = []
+        for g in group:
+            all_dark.extend(g["dark_pos"])
+        if not all_dark:
+            i = j; continue
+        wick_top = min(all_dark)
+        wick_bottom = max(all_dark)
+        # body detection: find densest contiguous dark region inside (heuristic)
+        # build histogram of dark positions
+        hist = {}
+        for p in all_dark:
+            hist[p] = hist.get(p, 0) + 1
+        # find longest contiguous run with high counts → body region
+        runs = []
+        sorted_keys = sorted(hist.keys())
+        run_start = None; run_prev = None
+        for k in sorted_keys:
+            if run_start is None:
+                run_start = k; run_prev = k
+            elif k - run_prev <= 2:
+                run_prev = k
+            else:
+                runs.append((run_start, run_prev)); run_start = k; run_prev = k
+        if run_start is not None:
+            runs.append((run_start, run_prev))
+        # choose run with max total count (likely body)
+        best_run = None; best_score = -1
+        for (a,b) in runs:
+            score = sum(hist.get(y,0) for y in range(a,b+1))
+            if score > best_score:
+                best_score = score; best_run = (a,b)
+        if best_run:
+            body_top = best_run[0]; body_bottom = best_run[1]
         else:
-            results.append(("NoClearPattern", 0.6))
-    return results
+            # fallback: narrow body in middle
+            body_mid = (wick_top + wick_bottom) // 2
+            body_top = body_mid; body_bottom = body_mid
+        # determine color guess: compare average darkness above vs below body to infer filled/empty
+        above_dark = sum(255 - pixels[group[0]["x"], y] for y in range(max(0, body_top-2), body_top+1)) if body_top>0 else 0
+        below_dark = sum(255 - pixels[group[0]["x"], y] for y in range(body_bottom, min(Hc, body_bottom+3)))
+        color = "green" if below_dark > above_dark else "red"
+        # convert positions back to original image coordinates (global)
+        global_wick_top = top + wick_top
+        global_wick_bottom = top + wick_bottom
+        candle = {
+            "wick_top": global_wick_top,
+            "wick_bottom": global_wick_bottom,
+            "body_top": top + body_top,
+            "body_bottom": top + body_bottom,
+            "color": color,
+            "group_x": left + group[len(group)//2]["x"]
+        }
+        candles.append(candle)
+        i = j
 
-# Fuse Roboflow + local -> label_scores (aggressive combination)
-def fuse_labels(roboflow_res, local_preds):
-    scores = {}
-    # Roboflow predictions (high weight)
-    if roboflow_res and isinstance(roboflow_res, dict) and "predictions" in roboflow_res:
-        for p in roboflow_res["predictions"]:
-            cls = p.get("class","").lower(); conf = float(p.get("confidence",0.0))
-            label = ROBOFLOW_TO_LABEL.get(cls, cls.title().replace("_"," "))
-            prev = scores.get(label, 0.0)
-            scores[label] = max(prev, conf * 0.98)
-    # local preds (additive, can push to decision)
-    for lab, sc in local_preds:
-        labn = lab if lab in LABEL_LIBRARY else lab.title().replace("_"," ")
-        prev = scores.get(labn, 0.0)
-        # local can add substantially (aggressive)
-        scores[labn] = max(prev, min(0.99, prev + sc * 0.65))
-    # ensure at least something
-    if not scores:
-        scores["NoClearPattern"] = 0.6
-    return scores
+    # if too few candles detected, try relaxing threshold (second pass)
+    if len(candles) < expected_min_candles and threshold > 5:
+        # reduce threshold and rerun a simple fallback pass
+        threshold2 = max(5, max_sum * 0.06)
+        candidate_cols = [c for c in col_profiles if c["sum"] >= threshold2]
+        # simple one-col-per-candle mapping
+        candles2 = []
+        for c in candidate_cols:
+            if not c["dark_pos"]: continue
+            wick_top = min(c["dark_pos"]); wick_bottom = max(c["dark_pos"])
+            body_top = wick_top + (wick_bottom - wick_top)//3
+            body_bottom = wick_bottom - (wick_bottom - wick_top)//3
+            color = "green" if True else "red"
+            candles2.append({
+                "wick_top": top + wick_top,
+                "wick_bottom": top + wick_bottom,
+                "body_top": top + body_top,
+                "body_bottom": top + body_bottom,
+                "color": color,
+                "group_x": left + c["x"]
+            })
+        # prefer richer set if larger
+        if len(candles2) > len(candles):
+            candles = candles2
 
-# Decision: aggressive anti-neutral thresholds
-def decide_from_labels(label_scores, candlesticks=None):
-    # accumulate direction-weighted contributions
-    bull = 0.0; bear = 0.0; neutral = 0.0; totalw = 0.0
-    rationale = []
-    for label, sc in label_scores.items():
-        meta = LABEL_LIBRARY.get(label, {"dir":"neutral","base_wr":0.5,"risk":4.0})
-        dirc = meta["dir"]; base = meta["base_wr"]
-        contrib = sc * base
-        totalw += sc
-        rationale.append(f"{label} (conf={sc:.2f}, baseWR={base})")
-        if dirc == "bull": bull += contrib
-        elif dirc == "bear": bear += contrib
-        else: neutral += contrib
-    bull_score = bull / (totalw + 1e-12)
-    bear_score = bear / (totalw + 1e-12)
-    neutral_score = neutral / (totalw + 1e-12)
-    # Aggressive decision rules:
-    # - If top label confidence > 0.80 -> follow it
-    # - If bull_score > bear_score * 1.1 -> buy (lower margin)
-    # - If bear_score > bull_score * 1.1 -> short
-    # - else if any label score > 0.6 -> follow its dir
+    # final guard: sort by group_x (left->right)
+    candles = sorted(candles, key=lambda c: c["group_x"])
+    return candles
+
+# -------------------------
+# Linear regression (simple) for trend detection
+# -------------------------
+def linear_regression_slope(y_values):
+    """
+    Compute slope of y = a + b*x with x = 0..n-1
+    returns slope (b). We use simple OLS formula.
+    """
+    n = len(y_values)
+    if n < 2:
+        return 0.0
+    xs = list(range(n))
+    mean_x = (n - 1) / 2.0
+    mean_y = sum(y_values) / n
+    num = sum((xs[i] - mean_x) * (y_values[i] - mean_y) for i in range(n))
+    den = sum((xs[i] - mean_x) ** 2 for i in range(n))
+    if den == 0:
+        return 0.0
+    slope = num / den
+    return slope
+
+def detect_trend_from_candles(candles):
+    """
+    Use center-of-body as proxy "close" for geometry-based regression.
+    Return: ("uptrend"/"downtrend"/"neutral", slope)
+    """
+    if len(candles) < 8:
+        return "neutral", 0.0
+    closes = []
+    for c in candles:
+        body_center = (c["body_top"] + c["body_bottom"]) / 2.0
+        # invert Y because pixel coordinates increase downward
+        closes.append(-body_center)
+    # take last N (max 50)
+    closes = closes[-50:]
+    slope = linear_regression_slope(closes)
+    # define slope thresholds heuristically (pixel-based)
+    # normalized by image height approx: but we keep raw slope and interpret relatively
+    if slope > 0.25:
+        return "uptrend", slope
+    elif slope < -0.25:
+        return "downtrend", slope
+    else:
+        return "neutral", slope
+
+# -------------------------
+# Multi-pattern voting system
+# -------------------------
+def pattern_votes_from_candles(candles):
+    """
+    Count weighted votes for bullish and bearish across recent candles.
+    Returns bull_score, bear_score and list of detected patterns.
+    """
+    bull = 0.0
+    bear = 0.0
+    patterns = []
+
+    # inspect recent N candles
+    window = min(len(candles), 40)
+    for c in candles[-window:]:
+        body = abs(c["body_bottom"] - c["body_top"]) + 1e-9
+        wick_top_len = abs(c["body_top"] - c["wick_top"])
+        wick_bot_len = abs(c["wick_bottom"] - c["body_bottom"])
+        total_wick = wick_top_len + wick_bot_len + 1e-9
+
+        # Hammer: long lower wick, small body
+        if wick_bot_len > 2.5 * body and wick_top_len < 0.6 * body:
+            bull += 1.2
+            patterns.append(("Hammer", c["group_x"]))
+        # Shooting star: long upper wick
+        if wick_top_len > 2.5 * body and wick_bot_len < 0.6 * body:
+            bear += 1.2
+            patterns.append(("Shooting Star", c["group_x"]))
+        # Doji: tiny body relative to wicks
+        if body < 0.12 * total_wick:
+            bull += 0.15; bear += 0.15
+            patterns.append(("Doji", c["group_x"]))
+        # Strong body (engulfing-like): body large relative to wick
+        if body > 0.6 * total_wick:
+            if c["color"] == "green":
+                bull += 0.8; patterns.append(("Strong Bull Body", c["group_x"]))
+            else:
+                bear += 0.8; patterns.append(("Strong Bear Body", c["group_x"]))
+
+    # additional formation heuristics: three white soldiers / three crows
+    if len(candles) >= 3:
+        last3 = candles[-3:]
+        if all((abs(cc["body_bottom"] - cc["body_top"]) > 0 and cc["color"] == "green") for cc in last3):
+            bull += 1.5
+            patterns.append(("Three White Soldiers", last3[-1]["group_x"]))
+        if all((abs(cc["body_bottom"] - cc["body_top"]) > 0 and cc["color"] == "red") for cc in last3):
+            bear += 1.5
+            patterns.append(("Three Black Crows", last3[-1]["group_x"]))
+
+    return bull, bear, patterns
+
+# -------------------------
+# Decision engine (aggressive)
+# -------------------------
+def decide_from_votes(bull, bear, trend, patterns, top_confidence_est=0.0):
+    """
+    Aggressive thresholds:
+    - If bull > bear * 1.1 and bull > 1.0 -> BUY
+    - If bear > bull * 1.1 and bear > 1.0 -> SHORT
+    - If any strong pattern (Three Soldiers, Hammer with trend) -> follow
+    - else neutral only if both scores small
+    """
     rec = "Neutral"
-    top_label, top_conf = max(label_scores.items(), key=lambda kv: kv[1])
-    if top_conf >= 0.80:
-        meta = LABEL_LIBRARY.get(top_label, {"dir":"neutral"})
-        rec = "Kaufen" if meta["dir"]=="bull" else ("Short" if meta["dir"]=="bear" else "Neutral")
-    elif bull_score > bear_score * 1.1 and bull_score > neutral_score * 0.9:
+    # apply trend bias
+    if trend == "uptrend":
+        bull *= 1.12
+    if trend == "downtrend":
+        bear *= 1.12
+
+    if bull > bear * 1.1 and bull > 0.9:
         rec = "Kaufen"
-    elif bear_score > bull_score * 1.1 and bear_score > neutral_score * 0.9:
+    elif bear > bull * 1.1 and bear > 0.9:
         rec = "Short"
     else:
-        # fallback: if any strong label > 0.65, follow it
-        strong = [(l,s) for l,s in label_scores.items() if s>0.65]
-        if strong:
-            lab = max(strong, key=lambda x: x[1])[0]
-            meta = LABEL_LIBRARY.get(lab, {"dir":"neutral"})
-            rec = "Kaufen" if meta["dir"]=="bull" else ("Short" if meta["dir"]=="bear" else "Neutral")
+        # check powerful single patterns
+        strong_names = [p[0] for p in patterns]
+        if any(x in strong_names for x in ("Three White Soldiers","Morning Star")) and bull > 0.5:
+            rec = "Kaufen"
+        elif any(x in strong_names for x in ("Three Black Crows","Evening Star")) and bear > 0.5:
+            rec = "Short"
         else:
-            # final fallback: if local heuristics suggest trending (Three Soldiers) -> buy
-            if "Three White Soldiers" in label_scores and label_scores["Three White Soldiers"] > 0.5:
+            # if either vote is moderate and top_confidence_est is decent -> follow
+            if bull > 0.6 and top_confidence_est > 0.6:
                 rec = "Kaufen"
+            elif bear > 0.6 and top_confidence_est > 0.6:
+                rec = "Short"
             else:
                 rec = "Neutral"
-    # probability and risk estimates
-    prob = bull_score*100 if rec=="Kaufen" else (bear_score*100 if rec=="Short" else max(bull_score,bear_score,neutral_score)*100)
-    prob = round(max(12.0, min(98.0, prob + (top_conf*10 - 5))),1)  # boost by top_conf
-    # risk weighted average
-    risk_sum = 0.0; wsum = 0.0
-    for label, sc in label_scores.items():
-        meta = LABEL_LIBRARY.get(label, {"risk":4.0})
-        risk_sum += sc * meta.get("risk",4.0); wsum += sc
-    risk_pct = round((risk_sum/(wsum+1e-12)),2) if wsum>0 else 4.0
-    # momentum tweak if candlesticks provided (small)
-    if candlesticks and len(candlesticks)>=20:
-        closes = [c["close"] for c in candlesticks[-50:]]
-        s10 = sum(closes[-10:])/10 if len(closes)>=10 else sum(closes)/len(closes)
-        s30 = sum(closes[-30:])/30 if len(closes)>=30 else s10
-        if rec=="Kaufen" and s10 > s30: prob = min(99.0, prob + 6.0)
-        if rec=="Short" and s10 < s30: prob = min(99.0, prob + 6.0)
-    return {"recommendation": rec, "probability": prob, "risk_pct": risk_pct, "rationale": rationale, "top_label": top_label, "top_conf": top_conf}
 
-# SL/TP mapping (aggressive)
-def compute_sl_tp(label_scores, candles):
-    last_price = candles[-1]["close"] if candles and len(candles)>0 else None
-    # weighted risk
-    w=0.0; rsum=0.0
-    for lab, sc in label_scores.items():
-        meta = LABEL_LIBRARY.get(lab, {"risk":4.0})
-        w += sc; rsum += sc * meta.get("risk",4.0)
-    risk = (rsum/(w+1e-12)) if w>0 else 4.0
-    # try pivot detection
-    sl=None; tp=None; notes=[]
-    if candles and len(candles)>=30:
-        highs = [c["high"] for c in candles]; lows = [c["low"] for c in candles]
-        # simple last local support/resistance detection: find last local min/max
-        def last_local_extrema(arr, typ="min", window=4):
-            n=len(arr)
-            for i in range(n-1, window-1, -1):
-                v = arr[i]
-                left = arr[i-window:i]; right = arr[i+1:i+window+1] if i+window+1<=n else []
-                if typ=="min":
-                    if all(v < x for x in left) and all(v < x for x in right): return v
-                else:
-                    if all(v > x for x in left) and all(v > x for x in right): return v
-            return None
-        last_support = last_local_extrema(lows, "min")
-        last_res = last_local_extrema(highs, "max")
-        lp = last_price
-        if last_support:
-            sl = last_support * (1 - 0.001)
-            notes.append("SL unter lokalem Support")
+    # compute probability estimate roughly
+    base = max(bull, bear, 0.1)
+    prob = min(99.0, max(12.0, round(30.0 + base * 25.0 + top_confidence_est * 20.0, 1)))
+    # risk estimate rough
+    risk = round(3.0 + (1.0 / (1.0 + base)) * 6.0, 2)
+    return {"recommendation": rec, "probability": prob, "risk_pct": risk}
+
+# -------------------------
+# SL/TP mapping (simple)
+# -------------------------
+def compute_sl_tp_from_candles(candles, recommendation):
+    """
+    Very simple SL/TP:
+    - find last local support / resistance from wick extremes
+    - if none, use relative percentages based on risk
+    """
+    if not candles:
+        return {"stop": None, "tp": None, "notes": ["keine Kerzen"]}
+
+    last = candles[-1]
+    last_center = (last["body_top"] + last["body_bottom"]) / 2.0
+    # build lists of recent wick tops and bottoms
+    highs = [c["wick_top"] for c in candles]  # note: pixel coordinates -> inverted later; we use differences
+    lows = [c["wick_bottom"] for c in candles]
+    # simple detection: last local min below last_center
+    supports = [l for l in lows if l > last_center]  # pixel coords: larger means lower visually -> support below current level
+    resistances = [h for h in highs if h < last_center]
+    # convert to price-like numbers by inverting pixel coords (higher on screen -> lower pixel)
+    # here we'll compute relative percentages using distances
+    stop=None; tp=None; notes=[]
+    if recommendation == "Kaufen":
+        if supports:
+            stop = supports[-1]  # closest support (pixel)
+            notes.append("Stop unter lokalem Support (pixel-basiert)")
+            tp = last_center - (stop - last_center) * 1.8  # mirror
         else:
-            sl = lp * (1 - risk/100.0)
-            notes.append("SL relativ (kein Support)")
-        if last_res:
-            tp = last_res * (1 + 0.001)
-            notes.append("TP an lokalem Widerstand")
+            # relative percent method
+            stop = last_center + abs(last_center)*0.02
+            tp = last_center - abs(last_center)*0.04
+            notes.append("Relative SL/TP (kein Support)")
+    elif recommendation == "Short":
+        if resistances:
+            stop = resistances[-1]
+            notes.append("Stop über lokalem Widerstand (pixel-basiert)")
+            tp = last_center + (last_center - stop) * 1.8
         else:
-            tp = lp * (1 + 2*risk/100.0)
-            notes.append("TP relativ (kein Widerstand)")
+            stop = last_center - abs(last_center)*0.02
+            tp = last_center + abs(last_center)*0.04
+            notes.append("Relative SL/TP (kein Widerstand)")
     else:
-        if last_price:
-            sl = last_price * (1 - risk/100.0)
-            tp = last_price * (1 + 2*risk/100.0)
-            notes.append("Relative SL/TP (zu wenig Historie)")
-        else:
-            notes.append("Keine Preisinfo")
-    return {"stop": None if sl is None else round(sl,6), "tp": None if tp is None else round(tp,6), "notes": notes, "risk_est": round(risk,2)}
+        notes.append("Keine SL/TP (Neutral)")
+    # return pixel-based numbers — user should map to price context; for UI we display only 'relative' explanation
+    return {"stop": None if stop is None else round(stop,2), "tp": None if tp is None else round(tp,2), "notes": notes}
 
-# Backtest helper (Finnhub fetch + simple evaluation)
-def fetch_finnhub_candles(symbol, resolution="5", from_ts=None, to_ts=None):
-    if not FINNHUB_KEY:
-        return None
-    try:
-        if to_ts is None: to_ts = int(time.time())
-        if from_ts is None: from_ts = to_ts - 60*60*24*90
-        params = {"symbol": symbol, "resolution": resolution, "from": str(int(from_ts)), "to": str(int(to_ts)), "token": FINNHUB_KEY}
-        url = "https://finnhub.io/api/v1/stock/candle?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, timeout=20) as resp:
-            raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
-        if data.get("s") != "ok": return None
-        ts = data.get("t",[]); o=data.get("o",[]); h=data.get("h",[]); l=data.get("l",[]); c=data.get("c",[])
-        candles=[]
-        for i,t in enumerate(ts):
-            dt = datetime.utcfromtimestamp(int(t))
-            candles.append({"t":dt,"open":float(o[i]),"high":float(h[i]),"low":float(l[i]),"close":float(c[i])})
-        return candles
-    except Exception:
-        return None
-
-def generate_simulated_candles(seed, periods=800, start=100.0, res_mins=5):
-    rnd = random.Random(abs(hash(seed))%(2**31))
-    p = float(start)
-    arr=[]
-    for i in range(periods):
-        drift = (rnd.random()-0.49)*0.002
-        shock = (rnd.random()-0.5)*0.01
-        p = max(0.01, p*(1+drift+shock))
-        o = round(p*(1+random.uniform(-0.002,0.002)),6); c = round(p,6)
-        h = round(max(o,c)*(1+random.uniform(0,0.003)),6); l = round(min(o,c)*(1-random.uniform(0,0.003)),6)
-        arr.append({"t": datetime.utcnow() - timedelta(minutes=(periods-i)*res_mins), "open":o, "high":h, "low":l, "close":c})
-    return arr
-
-def simple_backtest(candles, pattern_label, lookahead=10, slippage_pct=0.05, fee_pct=0.02):
-    # find pattern indices via simple detection for main patterns (only illustrative)
-    indices=[]
-    for i in range(1,len(candles)):
-        cur=candles[i]; prev=candles[i-1]
-        if pattern_label.lower().find("doji")>=0 and abs(cur["close"]-cur["open"]) < (cur["high"]-cur["low"])*0.15:
-            indices.append(i)
-        if pattern_label.lower().find("hammer")>=0 and is_hammer_local(cur):
-            indices.append(i)
-        if pattern_label.lower().find("engulf")>=0:
-            if (cur["close"]>cur["open"] and prev["close"]<prev["open"] and cur["open"]<prev["close"] and cur["close"]>prev["open"]) or \
-               (cur["close"]<cur["open"] and prev["close"]>prev["open"] and cur["open"]>prev["close"] and cur["close"]<prev["open"]):
-                indices.append(i)
-    trades=[]; wins=0
-    for idx in indices:
-        if idx+lookahead>=len(candles): continue
-        entry = candles[idx]["close"]*(1+slippage_pct/100.0)
-        exitp = candles[idx+lookahead]["close"]*(1 - slippage_pct/100.0)
-        net = (exitp - entry)/(entry+1e-12) - fee_pct/100.0
-        trades.append(net)
-        if net>0: wins+=1
-    total=len(trades)
-    winrate = (wins/total*100.0) if total>0 else 0.0
-    avg = (sum(trades)/total*100.0) if trades else 0.0
-    return {"pattern":pattern_label,"checked":total,"wins":wins,"winrate":round(winrate,2),"avg_return_pct":round(avg,3)}
-
-# small local hammer test reused
-def is_hammer_local(c):
-    body = abs(c["close"]-c["open"]); lower = min(c["open"], c["close"]) - c["low"]
-    return body>0 and lower > 2.5*body
-
-# Annotate image (draw labels + SL/TP)
-def annotate_image(image_bytes, label_scores, sl=None, tp=None):
-    if not PIL_AVAILABLE:
-        return None
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    except Exception:
-        return None
+# -------------------------
+# Annotate image (draw markers)
+# -------------------------
+def annotate_image_with_results(img_original, candles, patterns, decision, sltp):
+    """
+    Draw bounding markers and label boxes on a copy of the original image.
+    """
+    img = img_original.convert("RGBA")
     draw = ImageDraw.Draw(img, "RGBA")
     W,H = img.size
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 14)
     except Exception:
         font = None
-    # draw box of top labels
-    items = sorted(label_scores.items(), key=lambda kv: kv[1], reverse=True)[:6]
-    box_w = 320; box_h = 22*len(items) + 14
-    draw.rectangle([10,10,10+box_w,10+box_h], fill=(12,12,12,220))
-    y=14
-    for lab, sc in items:
-        txt = f"{lab}: {sc:.2f}"
-        draw.text((14,y), txt, fill=(230,238,246,255), font=font)
-        y += 22
-    # SL/TP lines approximate
-    if sl is not None:
-        draw.line([(12, int(H*0.14)), (W-12, int(H*0.14))], fill=(255,204,0,190), width=3)
-        draw.text((16, int(H*0.14)-12), f"Stop: {sl}", fill=(255,204,0,255), font=font)
-    if tp is not None:
-        draw.line([(12, int(H*0.18)), (W-12, int(H*0.18))], fill=(102,255,136,190), width=3)
-        draw.text((16, int(H*0.18)-12), f"TP: {tp}", fill=(102,255,136,255), font=font)
+
+    # draw small top-left info box
+    box_w = 360
+    lines = [
+        f"Empfehlung: {decision['recommendation']}  ({decision['probability']}%)",
+        f"Risiko: {decision['risk_pct']}%",
+        f"SL: {sltp.get('stop')}  TP: {sltp.get('tp')}"
+    ]
+    draw.rectangle([8,8,8+box_w, 14 + 20*len(lines)], fill=(10,10,12,220))
+    y = 12
+    for l in lines:
+        draw.text((12,y), l, fill=(230,238,246,255), font=font)
+        y += 20
+
+    # draw markers for patterns (x positions)
+    for p in patterns:
+        name, xpix = p[0], p[1]
+        # draw small arrow/marker at approximate x position
+        x = xpix; y0 = int(H*0.68)
+        draw.line([(x, y0-18), (x, y0+18)], fill=(255,200,80,200), width=2)
+        draw.ellipse([(x-6, y0-6), (x+6, y0+6)], outline=(255,200,80,200), width=2)
+        # label
+        draw.text((x+8, y0-6), name, fill=(230,238,246,255), font=font)
     return img
 
-# High-level analyze function (aggressive)
-def analyze_image_aggressive(image_bytes, symbol_hint=None, use_online=True):
-    rf_res = None
-    if use_online and ONLINE and ROBOFLOW_KEY:
-        rf_res = roboflow_detect(image_bytes, retries=2)
-    local_preds = local_detect_from_image_bytes(image_bytes)
-    label_scores = fuse_labels(rf_res, local_preds)
-    # fetch history for calibration/backtest
-    history = None
-    if use_online and ONLINE and FINNHUB_KEY and symbol_hint:
-        history = fetch_finnhub_candles(symbol_hint, resolution="5", from_ts=int(time.time())-60*60*24*90, to_ts=int(time.time()))
-    if not history:
-        history = generate_simulated_candles("img_hist_seed", 900, 100.0, 5)
-    decision = decide_from_labels(label_scores, candlesticks=history)
-    levels = compute_sl_tp(label_scores, history)
-    top = decision.get("top_label", None)
-    bt = simple_backtest(history, top or "NoClearPattern", lookahead=10)
-    # calibrate probability by blending with backtest winrate if available
-    if bt["checked"] > 0:
-        blended_prob = round((decision["probability"]*0.6 + bt["winrate"]*0.4),1)
-    else:
-        blended_prob = decision["probability"]
-    decision["probability"] = blended_prob
-    # annotate
-    annotated = annotate_image(image_bytes, label_scores, sl=levels.get("stop"), tp=levels.get("tp"))
-    # Build export object
+# -------------------------
+# Main analyze pipeline (high-level)
+# -------------------------
+def analyze_image_bytes(bytes_img):
+    img = load_image_bytes(bytes_img)
+    if img is None:
+        return {"error": "Bild konnte nicht geladen werden."}
+    gray = preprocess_image_for_chart(img)
+    candles = extract_candles_from_grayscale_image(gray)
+    # if too few candles, return neutral informing user to upload cleaner image
+    if len(candles) < 6:
+        return {"error": None, "message": "Nicht genug Kerzen gefunden. Bitte saubere Chartaufnahme (mehr Kerzen, weniger UI).", "candles": candles}
+
+    trend, slope = detect_trend_from_candles(candles)
+    bull, bear, patterns = pattern_votes_from_candles(candles)
+    # estimate top_conf (we use highest pattern weight from simple heuristics)
+    top_conf = 0.0
+    # derive top_conf from strongest local pattern signal heuristic:
+    if patterns:
+        top_conf = 0.7
+    # decide
+    decision = decide_from_votes(bull, bear, trend, patterns, top_confidence_est=top_conf)
+    sltp = compute_sl_tp_from_candles(candles, decision["recommendation"])
+    annotated = annotate_image_with_results(img, candles, patterns, decision, sltp)
     export = {
-        "meta": {"ts": now_iso(), "online": bool(rf_res and ONLINE), "symbol_hint": symbol_hint},
+        "meta": {"ts": now_iso(), "candles_detected": len(candles), "trend": trend, "slope": round(slope,4)},
         "final": {
             "recommendation": decision["recommendation"],
             "probability": decision["probability"],
             "risk_pct": decision["risk_pct"],
-            "rationale": decision.get("rationale", []),
-            "label_scores": dict(label_scores),
-            "levels": levels,
-            "backtest": bt
-        },
-        "internals": {"roboflow_raw": rf_res, "local_preds": local_preds}
+            "patterns": [p[0] for p in patterns[:8]],
+            "sltp": sltp
+        }
     }
-    append_audit({"ts": now_iso(), "type":"image_analysis", "summary": {"rec": decision["recommendation"], "prob": decision["probability"], "labels": list(label_scores.keys())}})
-    return {"export": export, "annotated": annotated}
+    # audit
+    append_audit({"ts": now_iso(), "summary": {"rec": decision["recommendation"], "prob": decision["probability"], "n_candles": len(candles)}})
+    return {"export": export, "annotated": annotated, "candles": candles, "decision": decision, "sltp": sltp}
 
 # -------------------------
-# Streamlit UI (focused)
+# Streamlit UI
 # -------------------------
-st.set_page_config(page_title="Lumina Pro — Aggressive Image Analyzer", layout="centered")
-st.title("Lumina Pro — Aggressive Bild-Analyzer")
-
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Seite", ["Analyze Bild","Audit","Einstellungen","Hilfe"])
 
 if page == "Analyze Bild":
-    st.header("Upload & Bulk-Analyse")
-    st.markdown("Lade ein Chart-Screenshot hoch (oder mehrere). Die App entscheidet aggressiv (wenig Neutral).")
-    uploaded = st.file_uploader("Chart-Bild (png/jpg) — bei mehreren: einzeln hochladen", type=["png","jpg","jpeg"])
-    symbol_hint = st.text_input("Symbol-Hinweis für Backtest (optional)", value="AAPL")
-    run = st.button("Analysiere (aggressiv)")
+    st.header("Bild-Analyzer — Neue (aggressive) Logik")
+    st.markdown("Lade ein Chart-Screenshot hoch (nur Kerzen-Bereich, wenig UI). Die App erkennt Kerzen geometrisch, bestimmt Trend per Regression und nutzt Multi-Pattern-Voting für eine klare Empfehlung.")
+    uploaded = st.file_uploader("Bild hochladen (png/jpg)", type=["png","jpg","jpeg"])
+    run = st.button("Analysiere Bild")
     if uploaded:
         st.image(uploaded, use_column_width=True)
         if run:
-            img_bytes = uploaded.read()
-            with st.spinner("Analysiere Bild..."):
+            bytes_img = uploaded.read()
+            with st.spinner("Analysiere Bild (Geometrie, Trend, Voting)..."):
                 try:
-                    res = analyze_image_aggressive(img_bytes, symbol_hint=symbol_hint, use_online=True)
+                    res = analyze_image_bytes(bytes_img)
                 except Exception as e:
-                    st.error("Fehler bei Analyse: " + str(e))
+                    st.error("Analyse fehlgeschlagen: " + str(e))
                     res = None
-            if res:
-                final = res["export"]
-                rec = final["final"]["recommendation"]
-                prob = final["final"]["probability"]
-                risk = final["final"]["risk_pct"]
-                if rec == "Kaufen":
-                    st.success(f"Empfehlung: {rec} • Wahrscheinlichkeit: {prob}% • Risiko: {risk}%")
-                elif rec == "Short":
-                    st.error(f"Empfehlung: {rec} • Wahrscheinlichkeit: {prob}% • Risiko: {risk}%")
-                else:
-                    st.info(f"Empfehlung: {rec} • Wahrscheinlichkeit: {prob}% • Risiko: {risk}%")
-                st.markdown("**Kurz-Fazit (3 Sätze):**")
-                labels = list(final["final"].get("label_scores",{}).keys())[:3]
-                st.write("- Erkannt: " + (", ".join(labels) if labels else "keine klaren Muster"))
-                st.write(f"- Wahrscheinlichkeit der Empfehlung: {prob} %  •  Risiko: {risk} %")
-                lv = final["final"].get("levels",{})
-                st.write(f"- SL / TP (empfohlen): {lv.get('stop')}  /  {lv.get('tp')}")
-                st.markdown("---")
-                st.subheader("Backtest (Top-Label)")
-                bt = final["final"].get("backtest",{})
-                st.write(bt.get("summary", bt))
-                if res.get("annotated") is not None:
-                    st.subheader("Annotiertes Bild")
-                    st.image(res["annotated"], use_column_width=True)
-                st.download_button("Export JSON", data=json.dumps(final, ensure_ascii=False, indent=2), file_name=f"analysis_{short_ts()}.json", mime="application/json")
-                st.download_button("Export CSV", data=(lambda o: "\n".join([",".join([k,str(v)]) for k,v in o.items()]))(final["final"]), file_name=f"analysis_{short_ts()}.csv", mime="text/csv")
+            if res is None:
+                st.error("Unbekannter Fehler.")
+            elif res.get("error"):
+                st.error(res["error"])
+            elif res.get("message"):
+                st.info(res["message"])
+                if res.get("candles"):
+                    st.write(f"Candles erkannt: {len(res['candles'])}")
             else:
-                st.error("Keine Ergebnisse — Roboflow/offline Fehler")
+                export = res["export"]
+                dec = res["decision"]
+                sltp = res["sltp"]
+                # show short result header
+                if dec["recommendation"] == "Kaufen":
+                    st.success(f"Empfehlung: {dec['recommendation']} • {dec['probability']}% • Risiko: {dec['risk_pct']}%")
+                elif dec["recommendation"] == "Short":
+                    st.error(f"Empfehlung: {dec['recommendation']} • {dec['probability']}% • Risiko: {dec['risk_pct']}%")
+                else:
+                    st.info(f"Empfehlung: {dec['recommendation']} • {dec['probability']}% • Risiko: {dec['risk_pct']}%")
+                st.markdown("**Kurz-Fazit (3 Sätze)**")
+                pats = export["final"].get("patterns", [])[:3]
+                s1 = "Erkannte Muster: " + (", ".join(pats) if pats else "keine eindeutigen Muster")
+                s2 = f"Geschätzte Trefferwahrscheinlichkeit: {dec['probability']}% • Risiko: {dec['risk_pct']}%"
+                s3 = f"Empfohlene SL/TP (relativ / pixel-basiert): {sltp.get('stop')} / {sltp.get('tp')}"
+                st.write("- " + s1); st.write("- " + s2); st.write("- " + s3)
+                st.markdown("---")
+                st.subheader("Annotiertes Bild")
+                if res.get("annotated"):
+                    st.image(res["annotated"], use_column_width=True)
+                st.markdown("---")
+                st.subheader("Export & Download")
+                st.download_button("Export JSON", data=json.dumps(export, ensure_ascii=False, indent=2), file_name=f"analysis_{short_ts()}.json", mime="application/json")
+                # CSV flatten quick
+                csv_buf = io.StringIO()
+                csv_buf.write("key,value\n")
+                for k,v in export["final"].items():
+                    if isinstance(v, (str,int,float)):
+                        csv_buf.write(f"{k},{v}\n")
+                    else:
+                        csv_buf.write(f"{k},\"{json.dumps(v, ensure_ascii=False)}\"\n")
+                st.download_button("Export CSV", data=csv_buf.getvalue(), file_name=f"analysis_{short_ts()}.csv", mime="text/csv")
 
 elif page == "Audit":
     st.header("Audit — letzte Analysen")
     try:
-        arr = json.load(open(AUDIT_FILE,"r",encoding="utf-8"))
+        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+            arr = json.load(f)
     except Exception:
         arr = []
-    st.write(f"Anzahl Analysen: {len(arr)}")
+    st.write(f"Analysen gespeichert: {len(arr)}")
     for a in arr[::-1][:200]:
-        st.write(f"- {a.get('ts')} • {a.get('type')} • {a.get('summary')}")
+        st.write(f"- {a.get('ts')} • {a.get('summary')}")
     if st.button("Audit löschen"):
-        with open(AUDIT_FILE,"w",encoding="utf-8") as f:
+        with open(AUDIT_FILE, "w", encoding="utf-8") as f:
             json.dump([], f)
-        st.success("Audit gelöscht")
+        st.success("Audit gelöscht.")
 
 elif page == "Einstellungen":
     st.header("Einstellungen")
-    st.write("Internet:", "✓" if ONLINE else "✗")
-    st.write("Pillow verfügbar:", PIL_AVAILABLE)
-    st.write("Roboflow Key gesetzt:", bool(ROBOFLOW_KEY))
-    st.write("Finnhub Key gesetzt:", bool(FINNHUB_KEY))
-    st.markdown("**Hinweis:** Keys sollten im Produktivbetrieb in `st.secrets` oder Umgebungsvariablen gespeichert werden.")
+    st.write("Offline-Analyzer (keine externen Keys benötigt)")
+    st.write("Pillow verfügbar:", True)
+    st.markdown("Tipps: Lade möglichst reine Chartbilder (nur Kerzen, wenig overlay), mindestens 20-40 Kerzen sichtbar für beste Ergebnisse.")
 
 elif page == "Hilfe":
     st.header("Hilfe")
     st.markdown("""
-    - Diese Version ist *aggressiv*: Ziel ist, so wenig Neutral wie möglich auszugeben.
-    - Lade saubere Chart-Screenshots (nur Candles, wenig UI) für beste Ergebnisse.
-    - Wenn die App zu aggressiv ist, sag Bescheid — wir erhöhen wieder die Schwellen.
-    - Exportiere Analysen via JSON/CSV.
+    - Dieser Analyzer ist aggressiv und versucht, so wenig Neutral wie möglich auszugeben.
+    - Wenn dein Bild trotzdem 'Neutral' liefert: 
+      - Stelle sicher, dass der Kerzenbereich vollständig sichtbar ist (oben und unten nicht abgeschnitten).
+      - Entferne UI-Elemente / Legenden.
+      - Liefere mehr Kerzen (mind. 20).
+    - Exportiere Analysen per JSON/CSV.
+    - Hinweis: Pixel-basierte SL/TP sind relativ — für echte Preise benötigst du Mapping Chartpixel→Preis.
     """)
 
-st.caption("Lumina Pro — Bild-Analyzer (aggressive). Keine Anlageberatung.")
+st.caption("Lumina Pro — Aggressive Image Analyzer — keine Anlageberatung.")

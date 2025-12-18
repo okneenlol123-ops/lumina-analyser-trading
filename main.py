@@ -1,4 +1,3 @@
-Backup analys
 # main.py
 # Ultimate Vision-Trader v3.0 — Upgrade (Option 1)
 # Advanced Image Analyzer + Accuracy UI + Pattern List + Hybrid + Backtest blend
